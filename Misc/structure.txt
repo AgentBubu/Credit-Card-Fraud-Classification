@@ -1,0 +1,55 @@
+📦 ProjectRoot
+┣ 📂 Data
+┃ ┣ 📜 creditcard.csv                    (raw Kaggle data)
+┃ ┣ 📜 EDA.ipynb                         (exploration + fixed preprocessing only)
+┃ ┗ 📜 creditcard_preprocessed.csv       (log1p(Amount) + hour_of_day/cyclic Time;
+┃                                          NOT standardized — that happens at
+┃                                          run-time, train-fit only, in Common/)
+┃
+┣ 📂 Common
+┃ ┣ 📜 config.py             (C_a=10, batch_size=200, split_ratio=0.7, seed=42,
+┃ ┃                            n_bootstrap=10, percentile=80, thresholds, etc.
+┃ ┃                            — single source of truth for every hyperparameter)
+┃ ┣ 📜 preprocessing.py      (train-fit z-score standardization of log1p(Amount)
+┃ ┃                            and cyclic-encoded hour_of_day; chronological
+┃ ┃                            70/30 split logic)
+┃ ┣ 📜 reward.py             (cost matrix: TN=0/FP=-Ca/FN=-Amount/TP=-Ca;
+┃ ┃                            0/1 label-matching reward; oracle reward;
+┃ ┃                            Amount-aware threshold t*=Ca/Amount)
+┃ ┗ 📜 metrics.py            (Precision/Recall/F1/AUPRC; cumulative reward/
+┃                              regret; fraud catch rate; false block rate;
+┃                              running/prequential versions of all of these)
+┃
+┣ 📂 Contextual_Bandits
+┃ ┣ 📂 CostSensitive                     (custom implementation, continuous $ reward)
+┃ ┃ ┣ 📜 EpsilonGreedy.py
+┃ ┃ ┣ 📜 LinUCB.py
+┃ ┃ ┣ 📜 LinTS.py
+┃ ┃ ┣ 📜 BootstrappedUCB.py              (custom — online bootstrap, linear regressors)
+┃ ┃ ┗ 📜 BootstrappedTS.py               (custom — online bootstrap, linear regressors)
+┃ ┗ 📂 LabelMatching01                   (contextualbandits library, {0,1} reward)
+┃   ┣ 📜 EpsilonGreedy.py
+┃   ┣ 📜 LinUCB.py
+┃   ┣ 📜 LinTS.py
+┃   ┣ 📜 BootstrappedUCB.py
+┃   ┗ 📜 BootstrappedTS.py
+┃
+┣ 📂 Supervised_Learning
+┃ ┣ 📜 LogisticRegression.py             (class_weight='balanced')
+┃ ┣ 📜 RandomForest.py                   (class_weight='balanced', 200 trees)
+┃ ┗ 📜 XGBoost.py                        (scale_pos_weight≈578, 200 est., depth 6)
+┃
+┣ 📂 Experiments
+┃ ┣ 📜 sensitivity_analysis.py           (Gap 4a: sweep C_a, check ranking stability)
+┃ ┗ 📜 partial_feedback_cost.py          (Gap 4c: bandit vs full-info-online vs
+┃                                          frozen batch-SL, decomposed regret)
+┃
+┣ 📂 Graphs                              (all plots: cumulative reward/regret,
+┃                                          sensitivity sweeps, PR curves, etc.)
+┃
+┣ 📂 Results                             (CSV/TXT: per-algorithm metrics,
+┃                                          confusion matrices, summary tables)
+┃
+┗ 📜 main.py                             (orchestrator: loads data, runs every
+                                           algorithm × conversion-type combo,
+                                           writes to Results/ and Graphs/)

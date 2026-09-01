@@ -1,0 +1,4 @@
+__pycache__
+*.pyc
+Data/creditcard_preprocessed.csv
+Data/creditcard.csv
