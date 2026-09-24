@@ -1,78 +1,120 @@
 """
 Contextual_Bandits/CostSensitive/CS_LinTS.py
 
-Custom cost-sensitive Linear Thompson Sampling, adapted to learn from
-continuous, dollar-valued rewards (see Common/reward.py:
-cost_sensitive_reward) rather than the binary {0,1} rewards the
-LabelMatching01 library version requires.
+Cost-sensitive Linear Thompson Sampling (Agrawal & Goyal, 2013).
 
-Mechanism: maintains a Bayesian linear regression posterior per arm
-(mean = A_inv @ b, covariance = v^2 * A_inv), updated incrementally via
-Sherman-Morrison. At each round, ONE parameter vector is sampled from
-each arm's posterior, and the arm whose sampled parameters predict the
-highest reward for this context is chosen. This randomized sampling is
-what drives exploration: arms with wide (uncertain) posteriors will
-occasionally produce optimistic samples that win, while arms with
-narrow (confident) posteriors rarely get an exploratory pick they don't
-deserve.
+What it learns
+--------------
+For each arm (Approve, Block), a Bayesian linear regression of the DOLLAR
+reward on the context: a posterior over the weights theta_arm with
+    mean        theta_hat = A^-1 b
+    covariance  v^2 * A^-1
+where A = ridge*I + sum of x x^T and b = sum of reward * x, over the
+rounds that arm was played. Rewards are continuous dollars from the
+shared cost matrix, hence a custom implementation (the contextualbandits
+library only accepts 0/1 rewards).
 
-PER-TRANSACTION INTERFACE: select_action(x) / update(x, arm, r), same
-as CS_EpsilonGreedy.py / CS_LinUCB.py in this folder.
+How it explores
+---------------
+Each round it draws one plausible weight vector per arm from its
+posterior and plays the arm whose draw predicts the higher reward. Arms
+the model is unsure about have wide posteriors, so they occasionally
+produce optimistic draws and get tried; as data accumulates the
+posteriors narrow and exploration fades on its own.
+
+Implementation shortcut (exact, not an approximation)
+-----------------------------------------------------
+The decision only ever uses the PREDICTED REWARD theta . x, never theta
+itself. If theta ~ N(theta_hat, v^2 A^-1), then theta . x is a
+one-dimensional normal:
+    theta . x ~ N( theta_hat . x ,  v^2 * x^T A^-1 x )
+So instead of drawing a full d-dimensional vector (which needs a matrix
+factorisation every round), we draw that single number directly. The
+decision it produces has exactly the same probability distribution --
+it is just far cheaper.
+
+Contract (see Common/runner.py)
+-------------------------------
+update_mode = "online", reward_type = "cost_sensitive", uses_bias = True
+select_action(x), update(x, action, reward), predict_score(x)
 """
 
 import numpy as np
 
-from Common.config import RANDOM_SEED, LINTS_V, RIDGE_LAMBDA
+from Common.config import APPROVE, BLOCK, N_ARMS, LINTS_V, RIDGE_LAMBDA
 
 
 class CS_LinTS:
-    """Cost-sensitive Linear Thompson Sampling (2 arms: 0=Approve, 1=Block)."""
+    # ---- runner contract ---------------------------------------------
+    update_mode = "online"
+    reward_type = "cost_sensitive"
+    uses_bias = True            # expects the context vector WITH the bias column
 
-    def __init__(self, n_arms=2, n_features=None, v=LINTS_V,
-                 ridge=RIDGE_LAMBDA, seed=RANDOM_SEED):
-        if n_features is None:
-            raise ValueError("n_features must be provided (dimension of the "
-                              "context vector, including the bias term if used).")
-        self.n_arms = n_arms
-        self.v = v  # posterior variance scaling: cov = v^2 * A_inv
-        self.A_inv = [np.eye(n_features) / ridge for _ in range(n_arms)]
-        self.b = [np.zeros(n_features) for _ in range(n_arms)]
+    # Re-symmetrise the stored inverse matrices every this many updates, to
+    # remove floating-point asymmetry that builds up over many rank-1 updates.
+    _SYMMETRISE_EVERY = 10_000
+
+    def __init__(self, n_features, seed, v=LINTS_V, ridge=RIDGE_LAMBDA):
+        """
+        n_features : length of the context vector (including the bias column)
+        seed       : random seed -- drives the posterior draws and tie-breaking
+        v          : posterior scale; covariance = v^2 * A^-1. Larger v means
+                     wider posteriors and more exploration. (The 0/1 library
+                     version uses v_sq = v^2 from config, so both conversion
+                     types explore with the same posterior width.)
+        ridge      : ridge regularisation (starting A = ridge * I)
+        """
+        self.d = n_features
+        self.v = v
         self.rng = np.random.default_rng(seed)
 
+        # Per arm: A_inv (d x d), b (d,), theta = posterior mean = A_inv @ b
+        self.A_inv = np.tile(np.eye(n_features) / ridge, (N_ARMS, 1, 1))
+        self.b = np.zeros((N_ARMS, n_features))
+        self.theta = np.zeros((N_ARMS, n_features))
+        self._n_updates = 0
+
+    # ---- deciding -----------------------------------------------------
     def select_action(self, x):
-        """x: context vector for a single transaction (n_features,).
-        Draws one posterior sample per arm and returns the arm whose
-        sample predicts the highest reward for this context."""
-        scores = np.zeros(self.n_arms)
-        for a in range(self.n_arms):
-            A_inv = self.A_inv[a]
-            mu = A_inv @ self.b[a]
-            cov = (self.v ** 2) * A_inv
-            theta_sample = self.rng.multivariate_normal(mu, cov)
-            scores[a] = theta_sample @ x
-        return int(np.argmax(scores))
+        """Thompson draw of each arm's predicted reward; play the higher one."""
+        mean = self.theta @ x                                        # (N_ARMS,)
+        var = np.einsum("aij,i,j->a", self.A_inv, x, x)              # x^T A^-1 x per arm
+        sd = self.v * np.sqrt(np.maximum(var, 0.0))                  # guard tiny negatives
+        draw = mean + sd * self.rng.standard_normal(N_ARMS)
+        return self._argmax_random_ties(draw)
 
-    def update(self, x, arm, r):
-        """Incrementally update the chosen arm's posterior with this
-        single transaction's (context, realized reward) pair.
+    def _argmax_random_ties(self, q):
+        """Break exact ties at random (rare here, since draws are continuous,
+        but kept for consistency with the other bandits)."""
+        best = np.flatnonzero(q == q.max())
+        return int(best[0]) if len(best) == 1 else int(self.rng.choice(best))
 
-        x:   context vector (n_features,)
-        arm: the action that was actually taken (0 or 1)
-        r:   realized reward for that action -- from
-             Common/reward.py: cost_sensitive_reward (continuous, dollars)
+    # ---- learning -----------------------------------------------------
+    def update(self, x, action, reward):
+        """Update the CHOSEN arm's posterior only (partial / bandit feedback),
+        with one Sherman-Morrison step:
+            (A + x x^T)^-1 = A^-1 - (A^-1 x)(A^-1 x)^T / (1 + x^T A^-1 x)
         """
-        A_inv = self.A_inv[arm]
+        A_inv = self.A_inv[action]                       # (d, d), a view
         Ax = A_inv @ x
-        denom = 1.0 + x @ Ax
-        self.A_inv[arm] = A_inv - np.outer(Ax, Ax) / denom  # Sherman-Morrison
-        self.b[arm] += r * x
+        A_inv -= np.outer(Ax, Ax) / (1.0 + x @ Ax)
+        self.b[action] += reward * x
+        self.theta[action] = A_inv @ self.b[action]
 
+        self._n_updates += 1
+        if self._n_updates % self._SYMMETRISE_EVERY == 0:
+            self.A_inv = 0.5 * (self.A_inv + np.swapaxes(self.A_inv, -1, -2))
+
+    # ---- scoring (for AUPRC only; never used to decide) ---------------
     def predict_score(self, x):
-        """Continuous score for the Block arm (arm 1), used ONLY for
-        AUPRC computation (Common/metrics.py). Uses the POSTERIOR MEAN
-        -- NOT a random posterior sample -- since a single Thompson
-        draw is too noisy to threshold-sweep for AUPRC (see
-        Common/metrics.py's docstring for the same reasoning).
+        """How strongly the posterior MEAN prefers blocking:
+            score = theta_hat_Block . x - theta_hat_Approve . x
+        Higher = more fraud-like. Uses the posterior mean, not a random
+        draw -- a single draw is too noisy to rank transactions by.
+
+        Why a difference and not the Block arm alone: blocking ALWAYS costs
+        C_a, so the Block arm learns roughly a constant and cannot rank
+        transactions; the fraud information lives in the Approve arm.
         """
-        theta_mean = self.A_inv[1] @ self.b[1]
-        return float(theta_mean @ x)
+        q = self.theta @ x
+        return float(q[BLOCK] - q[APPROVE])

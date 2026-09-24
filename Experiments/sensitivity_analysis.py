@@ -1,246 +1,178 @@
 """
 Experiments/sensitivity_analysis.py
 
-GAP 4a: Reward-matrix sensitivity analysis.
+Experiment 1 -- Cost sensitivity analysis 
 
-Question: does the ranking between Contextual Bandits and Supervised
-Learning (Gap 1's core comparison) depend on the exact value chosen for
-C_a (the administrative/investigation cost), or is it robust across a
-reasonable range? If the ranking flips depending on C_a, that's an
-important finding in itself -- it means getting the business economics
-right matters more than which algorithm is picked.
+Question
+--------
+The investigation cost C_a = $10 is a judgement call, not a measured fact.
+Does the project's conclusion -- which policies do best, and whether the
+cost-sensitive reward beats the 0/1 reward -- hold up if that number is
+different? This re-runs the main comparison at C_a = $1, $5, $10, $20, $50
+and checks whether the RANKING of policies changes.
 
-WHAT GETS RE-RUN vs. REUSED at each C_a value:
-  - Contextual Bandits (Contextual_Bandits/CostSensitive/CS_*.py): fully
-    RE-RUN from scratch at each C_a, because C_a is baked into the
-    reward every single bandit round receives -- there's no way to
-    "reuse" a bandit's learned parameters across different C_a values,
-    since a different C_a would have led it to make different decisions
-    (and therefore learn different things) all along the stream.
-  - Supervised models (Supervised_Learning/*.py): trained ONCE (C_a does
-    not affect training), then re-EVALUATED cheaply at each C_a via each
-    file's evaluate_at_threshold() -- see those files for why this
-    split exists.
+What is re-run, and what is only re-scored
+------------------------------------------
+Everything runs on the FULL dataset for both tracks, so bandit and
+supervised results are directly comparable at every C_a (the first build
+used a small subsample for the bandits only, which made that impossible).
 
-COMPUTATIONAL NOTE: re-running 5 bandits (2 of them 10-model bootstrap
-ensembles) from scratch at every C_a value, over the full ~285k-row
-dataset, is expensive. This script uses a STRATIFIED SUBSAMPLE (see
-SWEEP_SAMPLE_SIZE below) for the bandit sweep specifically -- we care
-about the *trend* across C_a values, not exact final dollar amounts
-(those are already reported at full scale by main.py). The subsample
-preserves the true fraud rate via stratified sampling. Supervised
-models are evaluated on the FULL test set regardless, since re-scoring
-(not re-training) is cheap.
+  Cost-sensitive bandits   RE-RUN at every C_a: C_a is part of the reward
+                           they learn from, so a different C_a leads to
+                           different decisions all the way along the stream.
+  0/1 label-matching       Decisions do not depend on C_a (the 0/1 reward
+  bandits                  never involves it): computed once, re-scored at
+                           each C_a.
+  Supervised models        Trained once; only the dynamic threshold
+                           C_a / Amount moves with C_a, so they are
+                           re-thresholded, never retrained.
+
+Supervised models use the PRIMARY (dynamic) threshold only: the flat 0.5
+threshold ignores C_a entirely, so sweeping it would show nothing.
+The C_a = $10 runs come straight from main.py's cache.
+
+How to read the results
+-----------------------
+Absolute dollar rewards are NOT comparable across C_a values -- a higher
+C_a makes every block more expensive, so everyone's reward shifts. The
+meaningful comparison is WITHIN each C_a: the ranking of policies, and the
+cost-sensitive vs 0/1 gap for each algorithm. The console report shows both.
+
+Outputs
+-------
+  Results/sensitivity_results.csv   one row per C_a x policy x seed:
+      C_a, policy, seed, TP, TN, FP, FN,
+      precision, recall, f1, auprc, cumulative_reward, cumulative_regret
+  Results/sensitivity_summary.csv   one row per C_a x policy: n_seeds, then
+      the mean and std of every numeric column (std blank for single runs)
+
+Usage
+-----
+  python -m Experiments.sensitivity_analysis
+  python -m Experiments.sensitivity_analysis --seeds 42 --C_a 5 10
+  python -m Experiments.sensitivity_analysis --policies CS_ XGBoost
 """
 
-import numpy as np
+import argparse
+import time
+
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from Common.config import (
-    RANDOM_SEED, C_A, GRAPHS_DIR, RESULTS_DIR, THRESHOLD_MODE_PRIMARY,
-)
-from Common.preprocessing import load_preprocessed_data, chronological_split, fit_standardizer, transform_features
-from Common.reward import cost_sensitive_reward, oracle_cost_sensitive_reward
+from Common import config
+from Common.config import C_A, C_A_SWEEP_VALUES, RESULTS_DIR, SEEDS, THRESHOLD_MODE_PRIMARY
+from Common.metrics import summarize_runs
+from Common.preprocessing import prepare_data
+from Common.runner import run_policy_all_seeds
 
-from Contextual_Bandits.CostSensitive.CS_EpsilonGreedy import CS_EpsilonGreedy
-from Contextual_Bandits.CostSensitive.CS_LinUCB import CS_LinUCB
-from Contextual_Bandits.CostSensitive.CS_LinTS import CS_LinTS
-from Contextual_Bandits.CostSensitive.CS_BootstrappedUCB import CS_BootstrappedUCB
-from Contextual_Bandits.CostSensitive.CS_BootstrappedTS import CS_BootstrappedTS
+# Re-use main.py's policy definitions, so both scripts run exactly the same policies.
+from main import bandit_specs, supervised_specs, _selected
 
-from Supervised_Learning.LogisticRegression import (
-    train_and_predict as lr_train_and_predict, evaluate_at_threshold as lr_evaluate,
-)
-from Supervised_Learning.RandomForest import (
-    train_and_predict as rf_train_and_predict, evaluate_at_threshold as rf_evaluate,
-)
+RESULT_COLUMNS = [
+    "C_a", "policy", "seed", "TP", "TN", "FP", "FN",
+    "precision", "recall", "f1", "auprc", "cumulative_reward", "cumulative_regret",
+]
+ID_COLUMNS = ["C_a", "policy"]
+VALUE_COLUMNS = RESULT_COLUMNS[3:]
 
-# XGBoost is optional here: environments without it installed can still
-# run the rest of the sweep (bandits + LR + RF) without crashing.
-try:
-    from Supervised_Learning.XGBoost import (
-        train_and_predict as xgb_train_and_predict, evaluate_at_threshold as xgb_evaluate,
-    )
-    _HAS_XGBOOST = True
-except ImportError:
-    _HAS_XGBOOST = False
+RESULTS_CSV = RESULTS_DIR / "sensitivity_results.csv"
+SUMMARY_CSV = RESULTS_DIR / "sensitivity_summary.csv"
+
+# Algorithm pairs for the cost-sensitive vs 0/1 check at every C_a.
+ALGORITHM_PAIRS = [("EpsilonGreedy", "CS_EpsilonGreedy", "LM_EpsilonGreedy"),
+                   ("LinUCB", "CS_LinUCB", "LM_LinUCB"),
+                   ("LinTS", "CS_LinTS", "LM_LinTS"),
+                   ("BootstrappedUCB", "CS_BootstrappedUCB", "LM_BootstrappedUCB"),
+                   ("BootstrappedTS", "CS_BootstrappedTS", "LM_BootstrappedTS")]
 
 
-# ------------------------------------------------------------------
-# Sweep configuration
-# ------------------------------------------------------------------
-C_A_SWEEP_VALUES = [1.0, 5.0, 10.0, 20.0, 50.0]  # centered on the project default (10.0)
-SWEEP_SAMPLE_SIZE = 15000  # see module docstring: subsample used for the BANDIT sweep only
-
-
-def _make_bandit_policies(n_features):
-    """Fresh, untrained instances of all 5 CostSensitive bandits --
-    MUST be reconstructed at every C_a sweep point (see module docstring)."""
+def run_to_row(run, spec, C_a):
+    m = run.metrics
     return {
-        "CS_EpsilonGreedy": CS_EpsilonGreedy(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinUCB": CS_LinUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinTS": CS_LinTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedUCB": CS_BootstrappedUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedTS": CS_BootstrappedTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
+        "C_a": C_a,
+        "policy": spec.name,
+        "seed": "" if spec.deterministic else run.seed,
+        **{k: m[k] for k in ("TP", "TN", "FP", "FN", "precision", "recall", "f1",
+                             "auprc", "cumulative_reward", "cumulative_regret")},
     }
 
 
-def _stratified_subsample(df, n, seed=RANDOM_SEED):
-    """Stratified subsample preserving the true fraud rate, then
-    re-sorted chronologically (bandits must still see transactions in
-    time order)."""
-    if len(df) <= n:
-        return df
-    fraud_df = df[df["Class"] == 1]
-    legit_df = df[df["Class"] == 0]
-    frac = n / len(df)
-    fraud_sample = fraud_df.sample(frac=frac, random_state=seed)
-    n_legit = n - len(fraud_sample)
-    legit_sample = legit_df.sample(n=n_legit, random_state=seed)
-    return pd.concat([fraud_sample, legit_sample]).sort_values("Time").reset_index(drop=True)
+# =====================================================================
+# Console report: is the conclusion robust to C_a?
+# =====================================================================
+def report(summary):
+    means = summary.pivot(index="policy", columns="C_a", values="cumulative_reward_mean")
+    ranks = means.rank(ascending=False, method="min").astype(int)   # 1 = best at that C_a
+    order = ranks[C_A].sort_values().index if C_A in ranks.columns else ranks.index
 
+    print("\n=== Ranking within each C_a (1 = best; compare down each column) ===")
+    print(ranks.loc[order].to_string())
 
-def run_bandit_sweep():
-    """Re-runs all 5 CostSensitive bandits from scratch at every C_a
-    sweep value, on the stratified subsample. Returns a long-form
-    DataFrame: columns = [C_a, policy, cumulative_reward, cumulative_regret,
-    fraud_catch_rate, false_block_rate]."""
-    df_full = load_preprocessed_data()
-    df = _stratified_subsample(df_full, SWEEP_SAMPLE_SIZE)
-    print(f"Bandit sweep using stratified subsample: {len(df)} rows "
-          f"({int(df['Class'].sum())} fraud, {100*df['Class'].mean():.3f}%)")
+    print("\n=== Best policy at each C_a ===")
+    for c in means.columns:
+        best = means[c].idxmax()
+        print(f"  C_a = ${c:>4g}: {best:22s} (mean reward ${means.loc[best, c]:,.2f})")
 
-    train_df, _, split_idx = chronological_split(df)
-    from Common.config import CONTEXT_FEATURE_COLS
-    mu, sigma = fit_standardizer(train_df, CONTEXT_FEATURE_COLS)
-    X = transform_features(df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=True)
-    y = df["Class"].values
-    amounts = df["Amount"].values
-    n_features = X.shape[1]
-    T = len(df)
+    if C_A in ranks.columns and ranks.shape[1] > 1:
+        print(f"\n=== Rank agreement with the default C_a = ${C_A:g} "
+              f"(Spearman correlation; 1.0 = identical ordering) ===")
+        for c in ranks.columns:
+            if c != C_A:
+                rho = ranks[c].corr(ranks[C_A], method="spearman")
+                print(f"  C_a = ${c:>4g}: {rho:.3f}")
 
-    rows = []
-    for C_a in C_A_SWEEP_VALUES:
-        policies = _make_bandit_policies(n_features)
-        cum_reward = {name: 0.0 for name in policies}
-        cum_regret = {name: 0.0 for name in policies}
-        blocked_fraud = {name: 0 for name in policies}
-        blocked_legit = {name: 0 for name in policies}
-        n_fraud_total = int((y[split_idx:] == 1).sum())
-        n_legit_total = int((y[split_idx:] == 0).sum())
-
-        for t in range(T):
-            x_t, label_t, amt_t = X[t], y[t], amounts[t]
-            opt_r = oracle_cost_sensitive_reward(label_t, amt_t, C_a=C_a)
-            for name, policy in policies.items():
-                a = policy.select_action(x_t)
-                r = cost_sensitive_reward(a, label_t, amt_t, C_a=C_a)
-                policy.update(x_t, a, r)
-                # Only count TEST-region transactions toward the reported
-                # metrics -- the train region is warm-up (see main.py /
-                # real_data_experiment.py design established earlier).
-                if t >= split_idx:
-                    cum_reward[name] += r
-                    cum_regret[name] += (opt_r - r)
-                    if a == 1 and label_t == 1:
-                        blocked_fraud[name] += 1
-                    if a == 1 and label_t == 0:
-                        blocked_legit[name] += 1
-
-        for name in policies:
-            rows.append({
-                "C_a": C_a,
-                "policy": name,
-                "cumulative_reward": cum_reward[name],
-                "cumulative_regret": cum_regret[name],
-                "fraud_catch_rate": blocked_fraud[name] / n_fraud_total if n_fraud_total else np.nan,
-                "false_block_rate": blocked_legit[name] / n_legit_total if n_legit_total else np.nan,
-            })
-        print(f"  C_a={C_a} done")
-
-    return pd.DataFrame(rows)
-
-
-def run_supervised_sweep():
-    """Trains each supervised model ONCE, then re-evaluates it cheaply
-    at every C_a sweep value via evaluate_at_threshold(). Returns a
-    long-form DataFrame with the same columns as run_bandit_sweep()."""
-    rows = []
-
-    model_fns = [
-        ("LogisticRegression", lr_train_and_predict, lr_evaluate),
-        ("RandomForest", rf_train_and_predict, rf_evaluate),
-    ]
-    if _HAS_XGBOOST:
-        model_fns.append(("XGBoost", xgb_train_and_predict, xgb_evaluate))
-    else:
-        print("xgboost not installed in this environment -- skipping XGBoost "
-              "in the sensitivity sweep. Install xgboost and re-run to include it.")
-
-    for model_name, train_fn, eval_fn in model_fns:
-        y_test, amounts_test, p_fraud = train_fn()  # trained ONCE
-        for C_a in C_A_SWEEP_VALUES:
-            metrics = eval_fn(y_test, amounts_test, p_fraud, C_a=C_a, mode=THRESHOLD_MODE_PRIMARY)
-            rows.append({
-                "C_a": C_a,
-                "policy": model_name,
-                "cumulative_reward": metrics["cumulative_reward"],
-                "cumulative_regret": metrics["cumulative_regret"],
-                "fraud_catch_rate": metrics["fraud_catch_rate"],
-                "false_block_rate": metrics["false_block_rate"],
-            })
-        print(f"  {model_name} evaluated across all C_a sweep values")
-
-    return pd.DataFrame(rows)
+    pairs = [(a, cs, lm) for a, cs, lm in ALGORITHM_PAIRS
+             if cs in means.index and lm in means.index]
+    if pairs:
+        print("\n=== Cost-sensitive advantage over 0/1 reward "
+              "(positive = cost-sensitive better), per C_a ===")
+        gap = pd.DataFrame({a: means.loc[cs] - means.loc[lm] for a, cs, lm in pairs}).T
+        with pd.option_context("display.float_format", "{:,.0f}".format):
+            print(gap.to_string())
+        wins = (gap > 0).sum()
+        print("  cost-sensitive wins: " +
+              ", ".join(f"C_a=${c:g}: {int(wins[c])}/{len(pairs)}" for c in gap.columns))
 
 
 def main():
-    print("=== Gap 4a: Reward-matrix (C_a) sensitivity sweep ===\n")
+    parser = argparse.ArgumentParser(description="Experiment 1: cost sensitivity analysis.")
+    parser.add_argument("--C_a", type=float, nargs="+", default=list(C_A_SWEEP_VALUES),
+                        help="investigation costs to sweep (default: from config)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
+    parser.add_argument("--policies", nargs="+", default=None,
+                        help="run only policies whose names contain one of these")
+    parser.add_argument("--no-cache", action="store_true")
+    args = parser.parse_args()
 
-    print("--- Contextual Bandits (re-run from scratch per C_a) ---")
-    bandit_df = run_bandit_sweep()
+    config.ensure_directories()
+    data = prepare_data()
+    print("=== Experiment 1: cost sensitivity analysis ===")
+    print(data.summary())
+    print(f"C_a values = {args.C_a} | seeds = {args.seeds}\n")
 
-    print("\n--- Supervised Learning (trained once, re-evaluated per C_a) ---")
-    sl_df = run_supervised_sweep()
+    specs = [s for s in bandit_specs(data.n_features + 1) + supervised_specs()
+             if _selected(s.name, args.policies)]
+    if not specs:
+        print("No policies matched --policies; nothing to do.")
+        return
 
-    combined_df = pd.concat([bandit_df, sl_df], ignore_index=True)
+    rows, t_start = [], time.time()
+    for c in args.C_a:
+        print(f"--- C_a = ${c:g} ---")
+        for spec in specs:
+            runs = run_policy_all_seeds(spec, data, seeds=args.seeds, C_a=c,
+                                        threshold_mode=THRESHOLD_MODE_PRIMARY,
+                                        use_cache=not args.no_cache, verbose=True)
+            rows += [run_to_row(r, spec, c) for r in runs]
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
-    combined_df.to_csv(RESULTS_DIR / "sensitivity_analysis_results.csv", index=False)
+    results = pd.DataFrame(rows)[RESULT_COLUMNS]
+    summary = summarize_runs(results, ID_COLUMNS, VALUE_COLUMNS)
+    results.to_csv(RESULTS_CSV, index=False)
+    summary.to_csv(SUMMARY_CSV, index=False)
 
-    # ------------------------------------------------------------------
-    # Check: does the CB-vs-SL ranking ever flip across the C_a range?
-    # ------------------------------------------------------------------
-    print("\n=== Ranking check: best policy at each C_a value ===")
-    for C_a in C_A_SWEEP_VALUES:
-        sub = combined_df[combined_df["C_a"] == C_a]
-        best = sub.loc[sub["cumulative_reward"].idxmax()]
-        print(f"  C_a={C_a:>5}: best policy = {best['policy']:20s} "
-              f"(cumulative reward = ${best['cumulative_reward']:,.2f})")
-
-    # ------------------------------------------------------------------
-    # Plot: cumulative reward vs. C_a, one line per policy
-    # ------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(9, 6))
-    for policy in combined_df["policy"].unique():
-        sub = combined_df[combined_df["policy"] == policy].sort_values("C_a")
-        ax.plot(sub["C_a"], sub["cumulative_reward"], marker="o", label=policy)
-    ax.axvline(C_A, color="black", linestyle="--", linewidth=1,
-               label=f"project default (C_a={C_A})")
-    ax.set_xlabel("C_a (administrative/investigation cost, $)")
-    ax.set_ylabel("Cumulative Reward ($)")
-    ax.set_title("Gap 4a: Sensitivity of CB-vs-SL Ranking to C_a")
-    ax.legend(fontsize=8, ncol=2)
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(GRAPHS_DIR / "sensitivity_analysis.png", dpi=150)
-
-    print(f"\nSaved: {RESULTS_DIR / 'sensitivity_analysis_results.csv'}")
-    print(f"Saved: {GRAPHS_DIR / 'sensitivity_analysis.png'}")
+    report(summary)
+    print(f"\nSaved {RESULTS_CSV}")
+    print(f"Saved {SUMMARY_CSV}")
+    print(f"Total time: {(time.time() - t_start) / 60:.1f} min")
 
 
 if __name__ == "__main__":

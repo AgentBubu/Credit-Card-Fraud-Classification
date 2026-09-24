@@ -1,134 +1,127 @@
 """
 Supervised_Learning/XGBoost.py
 
-Trains an XGBoost classifier on the chronological 70% train split
-(Common/preprocessing.py) and evaluates it on the held-out 30% test
-split, reporting BOTH:
-  1. Pure classification metrics: Precision, Recall, F1, AUPRC
-  2. Decision-quality metrics: cumulative reward, cumulative regret,
-     fraud catch rate, false block rate -- computed under BOTH the
-     PRIMARY (Amount-aware dynamic) and SECONDARY (flat 0.5)
-     classification thresholds (see Common/reward.py).
+XGBoost baseline (Track A: Supervised Learning).
 
-Why scale_pos_weight (~578, from Common/config.py): XGBoost's default
-gradient-boosting objective is symmetric across classes -- with 0.173%
-fraud, unweighted boosting would barely be pushed to separate the
-minority class. scale_pos_weight upweights the gradient contribution of
-positive (fraud) examples to compensate. Like class_weight='balanced'
-in LogisticRegression.py / RandomForest.py, this is a TRAINING-TIME
-patch specific to supervised learning.
+How it fits the pipeline
+------------------------
+Like the other supervised models: trained ONCE on the first 70%, frozen,
+then asked for P(fraud) on the last 30% by the shared runner
+(Common/runner.py, kind = "supervised"). Probabilities become
+Approve/Block decisions through the threshold rules in Common/reward.py:
 
-*** IMPORTANT, VERIFIED CAVEAT (please read before trusting results) ***
-Diagnostic testing on this real dataset (see project conversation log)
-confirmed that imbalance-correction weighting (class_weight='balanced'
-for Logistic Regression, and by the same mechanism likely
-scale_pos_weight here) INFLATES predicted P(fraud) well above true
-calibrated probabilities -- e.g. for Logistic Regression, median
-predicted P(fraud) jumped from 0.00037 (unweighted) to 0.040 (weighted),
-roughly 100x. This breaks the assumption the dynamic threshold's
-derivation depends on (that p_fraud is a calibrated probability), and
-was empirically confirmed to make the "theoretically optimal" dynamic
-threshold perform WORSE than the naive flat 0.5 threshold for Logistic
-Regression specifically (an inversion of what theory predicts).
-Random Forest did NOT show this inversion in the same test, so the
-severity appears to be model-dependent -- XGBoost's behavior here has
-NOT yet been empirically verified and should be checked the same way
-before trusting its dynamic-threshold results. A probability
-RECALIBRATION step (e.g. sklearn's CalibratedClassifierCV, or a
-closed-form prior-correction such as King & Zeng 2001) is the likely
-fix, pending a project-level decision on how to address it.
+  "dynamic" (PRIMARY)   block when P(fraud) > C_a / Amount
+  "flat"    (SECONDARY) block when P(fraud) > 0.5 (side comparison only)
+
+Training never depends on C_a, so the runner trains once per seed and
+re-thresholds for every C_a in the sensitivity sweep.
+
+scale_pos_weight -- computed from the TRAINING split, at fit time
+-----------------------------------------------------------------
+XGBoost's imbalance correction upweights the fraud class by
+n_legit / n_fraud. It is computed inside fit() from the labels the model
+is actually trained on -- the first 70% only (198,980 legit / 384 fraud
+= 518.18). The first build hardcoded ~578, which turned out to be the
+ratio over the FULL dataset: a small leak of test-region information.
+
+Like class_weight for the other two models, this weighting can inflate
+predicted probabilities, which matters for the dynamic threshold. How
+much it does so for XGBoost is part of what the results will show.
+
+Settings (from config.XGBOOST_PARAMS)
+-------------------------------------
+  n_estimators = 200, max_depth = 6, learning_rate = 0.1,
+  eval_metric = "logloss", tree_method = "hist"
+
+Randomness
+----------
+These settings use no row or column subsampling, so the seed has nothing
+to randomise. Verified on the installed version: seeds 42 and 43 produced
+identical probabilities on the full test set. The spec is therefore
+marked deterministic, so the runner trains it once instead of five
+identical times (as for Logistic Regression).
 """
 
 import numpy as np
 from xgboost import XGBClassifier
 
-from Common.config import CONTEXT_FEATURE_COLS, XGBOOST_PARAMS, C_A
-from Common.preprocessing import (
-    load_preprocessed_data,
-    chronological_split,
-    fit_standardizer,
-    transform_features,
-)
-from Common.reward import (
-    probabilities_to_actions,
-    cost_sensitive_reward_batch,
-    oracle_cost_sensitive_reward_batch,
-)
-from Common.metrics import classification_metrics, decision_quality_metrics, auprc
+from Common.config import XGBOOST_PARAMS
+from Common.runner import PolicySpec
+
+NAME = "XGBoost"
+GROUP = "Supervised Learning"
 
 
-def train_and_predict():
-    """The EXPENSIVE, C_a-INDEPENDENT part: load data, split, standardize,
-    train the model ONCE, predict P(fraud) on the test set. See
-    LogisticRegression.py in this folder for the full rationale.
+class XGBoostModel:
+    """Thin wrapper whose only job is to compute scale_pos_weight from the
+    training labels at fit time (the runner builds models before it has
+    seen any data). Runner contract: fit / predict_proba."""
 
-    Returns: y_test, amounts_test, p_fraud
-    """
-    # 1. Load + chronological split
-    df = load_preprocessed_data()
-    train_df, test_df, split_idx = chronological_split(df)
+    def __init__(self, seed):
+        self.seed = seed
+        self.model = None
+        self.scale_pos_weight = None
 
-    # 2. Standardize features (fit on TRAIN ONLY). Like Random Forest,
-    #    XGBoost's tree splits are invariant to monotonic feature
-    #    transforms -- this is applied only for pipeline consistency
-    #    across all three Supervised_Learning/ files.
-    mu, sigma = fit_standardizer(train_df, CONTEXT_FEATURE_COLS)
-    X_train = transform_features(train_df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=False)
-    X_test = transform_features(test_df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=False)
-    y_train = train_df["Class"].values
-    y_test = test_df["Class"].values
-    amounts_test = test_df["Amount"].values  # RAW dollars, for the reward function
+    def fit(self, X, y):
+        y = np.asarray(y)
+        n_fraud = int(np.sum(y == 1))
+        if n_fraud == 0:
+            raise ValueError("Training labels contain no fraud cases.")
+        self.scale_pos_weight = float(np.sum(y == 0)) / n_fraud
+        self.model = XGBClassifier(**XGBOOST_PARAMS,
+                                   scale_pos_weight=self.scale_pos_weight,
+                                   random_state=self.seed)
+        self.model.fit(X, y)
+        return self
 
-    # 3. Train (once, on the 70% train split; frozen thereafter)
-    model = XGBClassifier(**XGBOOST_PARAMS)
-    model.fit(X_train, y_train)
-
-    # 4. Predict P(fraud) on the held-out test set
-    p_fraud = model.predict_proba(X_test)[:, 1]
-
-    return y_test, amounts_test, p_fraud
+    def predict_proba(self, X):
+        if self.model is None:
+            raise RuntimeError("fit() must be called before predict_proba().")
+        return self.model.predict_proba(X)
 
 
-def evaluate_at_threshold(y_test, amounts_test, p_fraud, C_a=C_A, mode="dynamic"):
-    """The CHEAP, C_a-DEPENDENT part -- see LogisticRegression.py in this
-    folder for the full explanation. Safe to call repeatedly with
-    different C_a values without retraining."""
-    actions = probabilities_to_actions(p_fraud, amounts_test, mode=mode, C_a=C_a)
-    cls_metrics = classification_metrics(y_test, actions, y_score=p_fraud)
-    oracle_rewards = oracle_cost_sensitive_reward_batch(y_test, amounts_test, C_a=C_a)
-    rewards = cost_sensitive_reward_batch(actions, y_test, amounts_test, C_a=C_a)
-    regret = oracle_rewards - rewards
-    dq_metrics = decision_quality_metrics(y_test, actions, rewards, regret)
-    return {**cls_metrics, **dq_metrics}
+def build(seed):
+    """Fresh, untrained model."""
+    return XGBoostModel(seed)
 
 
-def train_and_evaluate(C_a=C_A):
-    """Convenience wrapper matching this file's original interface
-    (identical dict shape to LogisticRegression.py / RandomForest.py)."""
-    y_test, amounts_test, p_fraud = train_and_predict()
-
-    results = {
-        "model_name": "XGBoost",
-        "auprc": auprc(y_test, p_fraud),
-    }
-    for mode in ("dynamic", "flat"):
-        results[mode] = evaluate_at_threshold(y_test, amounts_test, p_fraud, C_a=C_a, mode=mode)
-
-    return results
+def spec():
+    """How main.py and the experiments refer to this model."""
+    return PolicySpec(name=NAME, kind="supervised", factory=build,
+                      group=GROUP, deterministic=True)
 
 
+# ---------------------------------------------------------------------
+# Run this file on its own for a quick standalone result:
+#     python -m Supervised_Learning.XGBoost
+# Also checks whether different seeds give different models.
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    results = train_and_evaluate()
-    print(f"=== {results['model_name']} ===")
-    print(f"AUPRC (threshold-independent): {results['auprc']:.4f}\n")
+    from Common.config import C_A, THRESHOLD_MODE_PRIMARY, THRESHOLD_MODE_SECONDARY, BASE_SEED
+    from Common.preprocessing import prepare_data
+    from Common.runner import run_policy
 
-    for mode, label in [("dynamic", "PRIMARY (Amount-aware dynamic)"),
-                         ("flat", "SECONDARY (flat 0.5, side-comparison only)")]:
-        r = results[mode]
-        print(f"--- {label} threshold ---")
-        print(f"  Precision: {r['precision']:.4f}   Recall: {r['recall']:.4f}   F1: {r['f1']:.4f}")
-        print(f"  Cumulative Reward: ${r['cumulative_reward']:,.2f}   "
-              f"Cumulative Regret: ${r['cumulative_regret']:,.2f}")
-        print(f"  Fraud Catch Rate: {r['fraud_catch_rate']:.1%}   "
-              f"False Block Rate: {r['false_block_rate']:.4%}")
-        print()
+    data = prepare_data()
+    print(data.summary(), "\n")
+
+    check = build(BASE_SEED).fit(data.X_train, data.y_train)
+    print(f"scale_pos_weight computed from the training split: {check.scale_pos_weight:.2f}\n")
+
+    for mode, label in ((THRESHOLD_MODE_PRIMARY, "PRIMARY (dynamic)"),
+                        (THRESHOLD_MODE_SECONDARY, "SECONDARY (flat 0.5)")):
+        m = run_policy(spec(), data, seed=BASE_SEED, C_a=C_A,
+                       threshold_mode=mode, verbose=False).metrics
+        print(f"--- {NAME}, {label} threshold, C_a = ${C_A:g}, seed {BASE_SEED} ---")
+        print(f"  cumulative reward {m['cumulative_reward']:>12,.2f}   "
+              f"regret {m['cumulative_regret']:>12,.2f}   savings capture {m['savings_capture']:.3f}")
+        print(f"  TP {m['TP']}  FP {m['FP']}  FN {m['FN']}  TN {m['TN']}   "
+              f"catch {m['fraud_catch_rate']:.3f} (oracle {m['oracle_catch_rate']:.3f})   "
+              f"false-block {m['false_block_rate']:.4f}")
+        print(f"  precision {m['precision']:.4f}  recall {m['recall']:.4f}  "
+              f"F1 {m['f1']:.4f}  AUPRC {m['auprc']:.4f}\n")
+
+    p1 = check.predict_proba(data.X_test)[:, 1]
+    p2 = build(BASE_SEED + 1).fit(data.X_train, data.y_train).predict_proba(data.X_test)[:, 1]
+    print(f"Seeds {BASE_SEED} vs {BASE_SEED + 1} give identical probabilities: "
+          f"{bool(np.array_equal(p1, p2))}")
+    print(f"Median predicted P(fraud) on the test set: {np.median(p1):.4f}")

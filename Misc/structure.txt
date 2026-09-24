@@ -40,8 +40,8 @@
 ┃ ┗ 📜 XGBoost.py                        (scale_pos_weight≈578, 200 est., depth 6)
 ┃
 ┣ 📂 Experiments
-┃ ┣ 📜 sensitivity_analysis.py           (Gap 4a: sweep C_a, check ranking stability)
-┃ ┗ 📜 partial_feedback_cost.py          (Gap 4c: bandit vs full-info-online vs
+┃ ┣ 📜 sensitivity_analysis.py           (check ranking stability)
+┃ ┗ 📜 partial_feedback_cost.py          (bandit vs full-info-online vs
 ┃                                          frozen batch-SL, decomposed regret)
 ┃
 ┣ 📂 Graphs                              (all plots: cumulative reward/regret,

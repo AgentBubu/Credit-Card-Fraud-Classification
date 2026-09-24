@@ -1,124 +1,103 @@
 """
 Supervised_Learning/RandomForest.py
 
-Trains a Random Forest classifier on the chronological 70% train split
-(Common/preprocessing.py) and evaluates it on the held-out 30% test
-split, reporting BOTH:
-  1. Pure classification metrics: Precision, Recall, F1, AUPRC
-  2. Decision-quality metrics: cumulative reward, cumulative regret,
-     fraud catch rate, false block rate -- computed under BOTH the
-     PRIMARY (Amount-aware dynamic) and SECONDARY (flat 0.5)
-     classification thresholds (see Common/reward.py).
+Random Forest baseline (Track A: Supervised Learning).
 
-Why class_weight='balanced': each tree's split-quality criterion (Gini
-impurity) is symmetric across classes -- with 0.173% fraud, unweighted
-splits would rarely bother separating out the minority class.
-'balanced' reweights samples so fraud-vs-legit splits are worth pursuing.
-This is a TRAINING-TIME patch specific to supervised learning; see
-Common/config.py for why the cost-sensitive bandits don't need an
-equivalent adjustment.
+How it fits the pipeline
+------------------------
+Exactly like the other supervised models: trained ONCE on the first 70%,
+frozen, then asked for P(fraud) on the last 30% by the shared runner
+(Common/runner.py, kind = "supervised"). The probabilities become
+Approve/Block decisions through the threshold rules in Common/reward.py:
 
-Note: feature standardization has NO EFFECT on a tree-based model's
-splits (trees split on thresholds and are invariant to any monotonic
-transform of a feature) -- it's applied here anyway only for pipeline
-consistency with the other Supervised_Learning/ files, not because
-Random Forest needs it.
+  "dynamic" (PRIMARY)   block when P(fraud) > C_a / Amount
+  "flat"    (SECONDARY) block when P(fraud) > 0.5 (side comparison only)
+
+Training never depends on C_a, so the runner trains once per seed and
+re-thresholds for every C_a in the sensitivity sweep.
+
+Settings (from config.RANDOM_FOREST_PARAMS)
+-------------------------------------------
+  n_estimators = 200, max_depth = None (fully grown trees)
+  class_weight = "balanced"  -- reweights the rare fraud class, as for
+                                Logistic Regression.
+  n_jobs = -1                -- uses all CPU cores for speed. Results
+                                stay reproducible for a given seed,
+                                because each tree's random state is fixed
+                                up front from random_state.
+
+Known fragility with the dynamic threshold (a reported finding)
+----------------------------------------------------------------
+A forest's "probability" is the share of its 200 trees voting fraud, so it
+moves in coarse steps of 0.005. The dynamic threshold C_a / Amount becomes
+tiny for large transactions: at $1,000 two stray fraud votes are enough to
+block, and at $2,000+ a single vote is. Thousands of legitimate test
+transactions receive at least one stray vote, so for large ones the
+decision hinges on how one or two fully grown trees happened to split.
+Measured effect: about 80% of false blocks came from just 1-5 of 200 trees,
+and the false-block count differed by ~2.3x between scikit-learn 1.8.0 and
+1.9.0 (184 vs ~430 at seed 42). With the project's reference version
+(1.9.0) the dynamic threshold therefore performs WORSE than the flat 0.5
+threshold for this model. The threshold rule needs probabilities that are
+reliable near zero; vote-share probabilities are too coarse there. This is
+reported rather than patched (e.g. with probability calibration), matching
+the decision made for Logistic Regression.
+
+Feature scaling has no effect on tree splits (trees are invariant to
+monotonic transforms); the standardised features are used only so every
+supervised model shares one data pipeline.
+
+Randomness
+----------
+Unlike Logistic Regression, a Random Forest IS random: each tree trains
+on a bootstrap sample and considers random feature subsets. Different
+seeds give different forests, so it runs once per seed (5 in total) and
+is reported as mean +/- std. Expect this to be the slowest model --
+roughly a few minutes per seed on the full training set. Results are
+cached, so each seed only trains once.
 """
 
-import numpy as np
-from sklearn.ensemble import RandomForestClassifier as _RandomForestClassifier
+from sklearn.ensemble import RandomForestClassifier
 
-from Common.config import CONTEXT_FEATURE_COLS, RANDOM_FOREST_PARAMS, C_A
-from Common.preprocessing import (
-    load_preprocessed_data,
-    chronological_split,
-    fit_standardizer,
-    transform_features,
-)
-from Common.reward import (
-    probabilities_to_actions,
-    cost_sensitive_reward_batch,
-    oracle_cost_sensitive_reward_batch,
-)
-from Common.metrics import classification_metrics, decision_quality_metrics, auprc
+from Common.config import RANDOM_FOREST_PARAMS
+from Common.runner import PolicySpec
+
+NAME = "RandomForest"
+GROUP = "Supervised Learning"
 
 
-def train_and_predict():
-    """The EXPENSIVE, C_a-INDEPENDENT part: load data, split, standardize,
-    train the model ONCE, predict P(fraud) on the test set. See
-    LogisticRegression.py in this folder for the full rationale --
-    identical split across all three Supervised_Learning/ files so
-    Experiments/sensitivity_analysis.py can sweep C_a without retraining
-    a 200-tree Random Forest at every sweep point.
-
-    Returns: y_test, amounts_test, p_fraud
-    """
-    # 1. Load + chronological split
-    df = load_preprocessed_data()
-    train_df, test_df, split_idx = chronological_split(df)
-
-    # 2. Standardize features (fit on TRAIN ONLY). See module docstring:
-    #    this doesn't change Random Forest's behavior, but keeps the
-    #    feature-prep pipeline identical across all Supervised_Learning/
-    #    files for a cleaner, more directly comparable codebase.
-    mu, sigma = fit_standardizer(train_df, CONTEXT_FEATURE_COLS)
-    X_train = transform_features(train_df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=False)
-    X_test = transform_features(test_df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=False)
-    y_train = train_df["Class"].values
-    y_test = test_df["Class"].values
-    amounts_test = test_df["Amount"].values  # RAW dollars, for the reward function
-
-    # 3. Train (once, on the 70% train split; frozen thereafter)
-    model = _RandomForestClassifier(**RANDOM_FOREST_PARAMS)
-    model.fit(X_train, y_train)
-
-    # 4. Predict P(fraud) on the held-out test set
-    p_fraud = model.predict_proba(X_test)[:, 1]
-
-    return y_test, amounts_test, p_fraud
+def build(seed):
+    """Fresh, untrained model (runner contract: fit / predict_proba)."""
+    return RandomForestClassifier(**RANDOM_FOREST_PARAMS, random_state=seed)
 
 
-def evaluate_at_threshold(y_test, amounts_test, p_fraud, C_a=C_A, mode="dynamic"):
-    """The CHEAP, C_a-DEPENDENT part -- see LogisticRegression.py in this
-    folder for the full explanation. Safe to call repeatedly with
-    different C_a values without retraining."""
-    actions = probabilities_to_actions(p_fraud, amounts_test, mode=mode, C_a=C_a)
-    cls_metrics = classification_metrics(y_test, actions, y_score=p_fraud)
-    oracle_rewards = oracle_cost_sensitive_reward_batch(y_test, amounts_test, C_a=C_a)
-    rewards = cost_sensitive_reward_batch(actions, y_test, amounts_test, C_a=C_a)
-    regret = oracle_rewards - rewards
-    dq_metrics = decision_quality_metrics(y_test, actions, rewards, regret)
-    return {**cls_metrics, **dq_metrics}
+def spec():
+    """How main.py and the experiments refer to this model."""
+    return PolicySpec(name=NAME, kind="supervised", factory=build,
+                      group=GROUP, deterministic=False)
 
 
-def train_and_evaluate(C_a=C_A):
-    """Convenience wrapper matching this file's original interface (see
-    LogisticRegression.py in this folder for the exact returned dict
-    shape -- identical across all three Supervised_Learning/ files)."""
-    y_test, amounts_test, p_fraud = train_and_predict()
-
-    results = {
-        "model_name": "RandomForest",
-        "auprc": auprc(y_test, p_fraud),
-    }
-    for mode in ("dynamic", "flat"):
-        results[mode] = evaluate_at_threshold(y_test, amounts_test, p_fraud, C_a=C_a, mode=mode)
-
-    return results
-
-
+# ---------------------------------------------------------------------
+# Run this file on its own for a quick standalone result (one seed):
+#     python -m Supervised_Learning.RandomForest
+# ---------------------------------------------------------------------
 if __name__ == "__main__":
-    results = train_and_evaluate()
-    print(f"=== {results['model_name']} ===")
-    print(f"AUPRC (threshold-independent): {results['auprc']:.4f}\n")
+    from Common.config import C_A, THRESHOLD_MODE_PRIMARY, THRESHOLD_MODE_SECONDARY, BASE_SEED
+    from Common.preprocessing import prepare_data
+    from Common.runner import run_policy
 
-    for mode, label in [("dynamic", "PRIMARY (Amount-aware dynamic)"),
-                         ("flat", "SECONDARY (flat 0.5, side-comparison only)")]:
-        r = results[mode]
-        print(f"--- {label} threshold ---")
-        print(f"  Precision: {r['precision']:.4f}   Recall: {r['recall']:.4f}   F1: {r['f1']:.4f}")
-        print(f"  Cumulative Reward: ${r['cumulative_reward']:,.2f}   "
-              f"Cumulative Regret: ${r['cumulative_regret']:,.2f}")
-        print(f"  Fraud Catch Rate: {r['fraud_catch_rate']:.1%}   "
-              f"False Block Rate: {r['false_block_rate']:.4%}")
-        print()
+    data = prepare_data()
+    print(data.summary(), "\n")
+    for mode, label in ((THRESHOLD_MODE_PRIMARY, "PRIMARY (dynamic)"),
+                        (THRESHOLD_MODE_SECONDARY, "SECONDARY (flat 0.5)")):
+        # The first call trains (and caches) the forest; the second reuses it.
+        m = run_policy(spec(), data, seed=BASE_SEED, C_a=C_A,
+                       threshold_mode=mode, verbose=True).metrics
+        print(f"--- {NAME}, {label} threshold, C_a = ${C_A:g}, seed {BASE_SEED} ---")
+        print(f"  cumulative reward {m['cumulative_reward']:>12,.2f}   "
+              f"regret {m['cumulative_regret']:>12,.2f}   savings capture {m['savings_capture']:.3f}")
+        print(f"  TP {m['TP']}  FP {m['FP']}  FN {m['FN']}  TN {m['TN']}   "
+              f"catch {m['fraud_catch_rate']:.3f} (oracle {m['oracle_catch_rate']:.3f})   "
+              f"false-block {m['false_block_rate']:.4f}")
+        print(f"  precision {m['precision']:.4f}  recall {m['recall']:.4f}  "
+              f"F1 {m['f1']:.4f}  AUPRC {m['auprc']:.4f}\n")

@@ -1,340 +1,213 @@
 """
 main.py
 
-Orchestrator for the full Credit Card Fraud Detection project: runs
-every algorithm x conversion-type combination and writes ONE combined
-results table to Results/ and a summary comparison plot to Graphs/.
+Goal 1 (Contextual Bandits vs Supervised Learning) and Goal 2
+(cost-sensitive vs 0/1 label-matching reward) -- the project's main
+comparison, at the default investigation cost C_A.
 
-THREE GROUPS, all evaluated on the SAME held-out test region:
+Policies (all scored on the SAME last-30% test region, with the SAME
+dollar ledger from Common/reward.py, via Common/metrics.py):
 
-  1. Contextual Bandits -- COST-SENSITIVE conversion (5x custom,
-     Contextual_Bandits/CostSensitive/CS_*.py)
-  2. Contextual Bandits -- 0/1 LABEL-MATCHING conversion (5x library,
-     Contextual_Bandits/LabelMatching01/*.py)
-  3. Supervised Learning (3x, Supervised_Learning/*.py)
+  Cost-Sensitive bandits (5)      CS_EpsilonGreedy, CS_LinUCB, CS_LinTS,
+                                  CS_BootstrappedUCB, CS_BootstrappedTS
+  0/1 Label-Matching bandits (5)  LM_EpsilonGreedy, LM_LinUCB, LM_LinTS,
+                                  LM_BootstrappedUCB, LM_BootstrappedTS
+  Supervised Learning (3)         LogisticRegression, RandomForest, XGBoost
+                                  -- each reported twice: dynamic threshold
+                                  (primary) and flat 0.5 (side comparison)
 
-METHODOLOGY (established early in this project, central to Gap 4): each
-policy's TRAINING reward can legitimately differ -- cost-sensitive $ for
-Group 1, binary 0/1 for Group 2, log-loss/Gini impurity for Group 3 --
-but every policy's REALIZED ACTIONS are re-scored, for the final
-comparison, under ONE SINGLE FIXED cost-sensitive evaluation ledger
-(Common/reward.py: cost_sensitive_reward). This is what makes all three
-groups comparable on the same dollar axis, and is exactly what answers
-"does training on 0/1 rewards produce a policy that's secretly worse at
-the real financial objective?" Group 2 additionally reports its own
-native 0/1 training reward as a reference-only diagnostic column.
+Randomised policies run once per seed in config.SEEDS; deterministic ones
+(Logistic Regression, XGBoost) run once, with the seed column left blank.
+The reference policies (Oracle, Full-Info Online) are not part of this
+comparison -- they belong to Experiment 2 (partial_feedback_cost.py).
 
-RUNTIME NOTE: expect several minutes for a full run. In development,
-Group 1 (5 bandits, full ~285k-row stream) took ~265s and Group 3's
-Random Forest training took ~160s -- Group 2 adds further time on top
-depending on your machine's contextualbandits performance. Set
-MAIN_SAMPLE_SIZE below to a smaller number for a quick smoke test.
+Outputs
+-------
+  Results/main_results.csv   one row per policy per seed:
+      policy, conversion_type, seed, TP, TN, FP, FN,
+      precision, recall, f1, auprc, cumulative_reward, cumulative_regret
+  Results/main_summary.csv   one row per policy: n_seeds, then the mean and
+      std of every numeric column (std blank for single-run policies)
+
+Usage
+-----
+  python main.py                        full run (all policies, all seeds)
+  python main.py --seeds 42             quick run with one seed
+  python main.py --policies CS_ XGBoost only policies whose names contain
+                                        one of these fragments
+  python main.py --no-cache             recompute everything from scratch
+
+Runs are cached (Results/cache/), so an interrupted run resumes where it
+stopped, and the experiments later reuse these results.
 """
 
-import numpy as np
+import argparse
+import time
+
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from matplotlib.patches import Patch
 
+from Common import config
 from Common.config import (
-    RANDOM_SEED, C_A, BATCH_SIZE, CONTEXT_FEATURE_COLS,
-    GRAPHS_DIR, RESULTS_DIR, THRESHOLD_MODE_PRIMARY,
+    C_A, RESULTS_DIR, SEEDS, THRESHOLD_MODE_PRIMARY, THRESHOLD_MODE_SECONDARY,
 )
-from Common.preprocessing import load_preprocessed_data, chronological_split, fit_standardizer, transform_features
-from Common.reward import (
-    cost_sensitive_reward, cost_sensitive_reward_batch,
-    oracle_cost_sensitive_reward, oracle_cost_sensitive_reward_batch,
-    label_matching_reward_batch,
-)
-from Common.metrics import classification_metrics, decision_quality_metrics
+from Common.metrics import summarize_runs
+from Common.preprocessing import prepare_data
+from Common.runner import PolicySpec, run_policy_all_seeds
 
-# Group 1: Cost-Sensitive bandits (custom implementation)
 from Contextual_Bandits.CostSensitive.CS_EpsilonGreedy import CS_EpsilonGreedy
 from Contextual_Bandits.CostSensitive.CS_LinUCB import CS_LinUCB
 from Contextual_Bandits.CostSensitive.CS_LinTS import CS_LinTS
 from Contextual_Bandits.CostSensitive.CS_BootstrappedUCB import CS_BootstrappedUCB
 from Contextual_Bandits.CostSensitive.CS_BootstrappedTS import CS_BootstrappedTS
 
-# Group 2: 0/1 Label-Matching bandits (contextualbandits library).
-# Optional import: environments without the library installed can still
-# run Groups 1 and 3.
-try:
-    from Contextual_Bandits.LabelMatching01.EpsilonGreedy import EpsilonGreedy as LM_EpsilonGreedy
-    from Contextual_Bandits.LabelMatching01.LinUCB import LinUCB as LM_LinUCB
-    from Contextual_Bandits.LabelMatching01.LinTS import LinTS as LM_LinTS
-    from Contextual_Bandits.LabelMatching01.BootstrappedUCB import BootstrappedUCB as LM_BootstrappedUCB
-    from Contextual_Bandits.LabelMatching01.BootstrappedTS import BootstrappedTS as LM_BootstrappedTS
-    _HAS_CONTEXTUALBANDITS = True
-except ImportError:
-    _HAS_CONTEXTUALBANDITS = False
+from Contextual_Bandits.LabelMatching01.EpsilonGreedy import EpsilonGreedy as LM_EpsilonGreedy
+from Contextual_Bandits.LabelMatching01.LinUCB import LinUCB as LM_LinUCB
+from Contextual_Bandits.LabelMatching01.LinTS import LinTS as LM_LinTS
+from Contextual_Bandits.LabelMatching01.BootstrappedUCB import BootstrappedUCB as LM_BootstrappedUCB
+from Contextual_Bandits.LabelMatching01.BootstrappedTS import BootstrappedTS as LM_BootstrappedTS
 
-# Group 3: Supervised Learning
-from Supervised_Learning.LogisticRegression import (
-    train_and_predict as lr_train_and_predict, evaluate_at_threshold as lr_evaluate,
-)
-from Supervised_Learning.RandomForest import (
-    train_and_predict as rf_train_and_predict, evaluate_at_threshold as rf_evaluate,
-)
-try:
-    from Supervised_Learning.XGBoost import (
-        train_and_predict as xgb_train_and_predict, evaluate_at_threshold as xgb_evaluate,
-    )
-    _HAS_XGBOOST = True
-except ImportError:
-    _HAS_XGBOOST = False
+from Supervised_Learning import LogisticRegression, RandomForest, XGBoost
+
+# Exact column orders (agreed layout)
+RESULT_COLUMNS = [
+    "policy", "conversion_type", "seed", "TP", "TN", "FP", "FN",
+    "precision", "recall", "f1", "auprc", "cumulative_reward", "cumulative_regret",
+]
+ID_COLUMNS = ["policy", "conversion_type"]
+VALUE_COLUMNS = RESULT_COLUMNS[3:]      # everything from TP onwards
+
+CS_GROUP = "Cost-Sensitive"
+LM_GROUP = "0/1 Label-Matching"
+SL_GROUP = {THRESHOLD_MODE_PRIMARY: "Supervised Learning (dynamic)",
+            THRESHOLD_MODE_SECONDARY: "Supervised Learning (flat 0.5)"}
+
+RESULTS_CSV = RESULTS_DIR / "main_results.csv"
+SUMMARY_CSV = RESULTS_DIR / "main_summary.csv"
 
 
-# Set to an integer (e.g. 10000) for a quick smoke test; None = full dataset.
-MAIN_SAMPLE_SIZE = None
-
-
-# ------------------------------------------------------------------
-# Group 1: Cost-Sensitive bandits (single-transaction online loop)
-# ------------------------------------------------------------------
-def _make_cost_sensitive_bandits(n_features):
-    return {
-        "CS_EpsilonGreedy": CS_EpsilonGreedy(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinUCB": CS_LinUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinTS": CS_LinTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedUCB": CS_BootstrappedUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedTS": CS_BootstrappedTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-    }
-
-
-def run_cost_sensitive_bandits(X, y, amounts, split_idx):
-    """Returns dict: policy_name -> {'reward','regret','action','score'}
-    arrays, TEST region only. 'score' is each policy's predict_score()
-    for the Block arm, captured BEFORE update() each round, used later
-    for AUPRC."""
-    n_features = X.shape[1]
-    T = len(X)
-    n_test = T - split_idx
-    policies = _make_cost_sensitive_bandits(n_features)
-
-    logs = {name: {"reward": np.zeros(n_test), "regret": np.zeros(n_test),
-                   "action": np.zeros(n_test, dtype=int), "score": np.zeros(n_test)}
-            for name in policies}
-
-    for t in range(T):
-        x_t, label_t, amt_t = X[t], y[t], amounts[t]
-        opt_r = oracle_cost_sensitive_reward(label_t, amt_t, C_a=C_A)
-        in_test = t >= split_idx
-        i = t - split_idx if in_test else None
-
-        for name, policy in policies.items():
-            score = policy.predict_score(x_t) if in_test else None
-            a = policy.select_action(x_t)
-            r = cost_sensitive_reward(a, label_t, amt_t, C_a=C_A)
-            policy.update(x_t, a, r)
-            if in_test:
-                logs[name]["reward"][i] = r
-                logs[name]["regret"][i] = opt_r - r
-                logs[name]["action"][i] = a
-                logs[name]["score"][i] = score
-
-        if (t + 1) % 50000 == 0:
-            print(f"  [Group 1: Cost-Sensitive bandits] ...processed {t + 1}/{T}")
-
-    return logs
-
-
-# ------------------------------------------------------------------
-# Group 2: 0/1 Label-Matching bandits (batch online loop)
-# ------------------------------------------------------------------
-def _make_label_matching_bandits():
-    return {
-        "LM_EpsilonGreedy": LM_EpsilonGreedy(n_arms=2, seed=RANDOM_SEED),
-        "LM_LinUCB": LM_LinUCB(n_arms=2, seed=RANDOM_SEED),
-        "LM_LinTS": LM_LinTS(n_arms=2, seed=RANDOM_SEED),
-        "LM_BootstrappedUCB": LM_BootstrappedUCB(n_arms=2, seed=RANDOM_SEED),
-        "LM_BootstrappedTS": LM_BootstrappedTS(n_arms=2, seed=RANDOM_SEED),
-    }
-
-
-def run_label_matching_bandits(X, y, amounts, split_idx):
-    """Returns dict: policy_name -> {'reward' (RE-SCORED in $ under the
-    SAME cost-sensitive ledger as everyone else -- see module
-    docstring), 'regret', 'action', 'native_training_reward' (the
-    policy's own 0/1 reward, reference only)} arrays, TEST region only.
-
-    NOTE ON AUPRC: unlike Group 1, no continuous score is captured here
-    -- the contextualbandits library's public API for a continuous
-    per-arm score was not confirmed against an installed copy of the
-    package in development (see Contextual_Bandits/LabelMatching01/
-    LinTS.py for the related, already-flagged uncertainty). AUPRC for
-    this group is reported as NaN rather than guessed at.
-    """
-    if not _HAS_CONTEXTUALBANDITS:
-        print("contextualbandits not installed -- skipping the 0/1 "
-              "Label-Matching bandit group entirely. Install it "
-              "(pip install contextualbandits) and re-run to include it.")
-        return {}
-
-    T = len(X)
-    n_test = T - split_idx
-    policies = _make_label_matching_bandits()
-
-    logs = {name: {"reward": np.zeros(n_test), "regret": np.zeros(n_test),
-                   "action": np.zeros(n_test, dtype=int),
-                   "native_training_reward": np.zeros(n_test)}
-            for name in policies}
-
-    for batch_start in range(0, T, BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, T)
-        X_batch = X[batch_start:batch_end]
-        y_batch = y[batch_start:batch_end]
-        amt_batch = amounts[batch_start:batch_end]
-        opt_r_batch = oracle_cost_sensitive_reward_batch(y_batch, amt_batch, C_a=C_A)
-
-        for name, policy in policies.items():
-            actions = np.asarray(policy.select_actions(X_batch))
-            native_r = label_matching_reward_batch(actions, y_batch)  # what the policy LEARNS from
-            policy.update(X_batch, actions, native_r)
-
-            # Re-score the SAME actions under the unified cost-sensitive
-            # ledger, for cross-group comparability (see module docstring).
-            cs_r = cost_sensitive_reward_batch(actions, y_batch, amt_batch, C_a=C_A)
-            cs_regret = opt_r_batch - cs_r
-
-            for j in range(len(X_batch)):
-                t = batch_start + j
-                if t >= split_idx:
-                    i = t - split_idx
-                    logs[name]["reward"][i] = cs_r[j]
-                    logs[name]["regret"][i] = cs_regret[j]
-                    logs[name]["action"][i] = actions[j]
-                    logs[name]["native_training_reward"][i] = native_r[j]
-
-        if (batch_start // BATCH_SIZE) % 200 == 0:
-            print(f"  [Group 2: LabelMatching01 bandits] ...processed {batch_end}/{T}")
-
-    return logs
-
-
-# ------------------------------------------------------------------
-# Group 3: Supervised Learning
-# ------------------------------------------------------------------
-def run_supervised_learning():
-    """Returns (results dict: model_name -> metrics_dict, y_test)."""
-    results = {}
-    y_test = None
-    model_fns = [
-        ("LogisticRegression", lr_train_and_predict, lr_evaluate),
-        ("RandomForest", rf_train_and_predict, rf_evaluate),
+# =====================================================================
+# Which policies to run
+# =====================================================================
+def bandit_specs(n_features_with_bias):
+    """The ten bandits. Cost-sensitive ones need the context length (they
+    build their own matrices); the library wrappers work it out themselves."""
+    d = n_features_with_bias
+    cs = [
+        ("CS_EpsilonGreedy", CS_EpsilonGreedy),
+        ("CS_LinUCB", CS_LinUCB),
+        ("CS_LinTS", CS_LinTS),
+        ("CS_BootstrappedUCB", CS_BootstrappedUCB),
+        ("CS_BootstrappedTS", CS_BootstrappedTS),
     ]
-    if _HAS_XGBOOST:
-        model_fns.append(("XGBoost", xgb_train_and_predict, xgb_evaluate))
-    else:
-        print("xgboost not installed -- skipping XGBoost.")
+    lm = [
+        ("LM_EpsilonGreedy", LM_EpsilonGreedy),
+        ("LM_LinUCB", LM_LinUCB),
+        ("LM_LinTS", LM_LinTS),
+        ("LM_BootstrappedUCB", LM_BootstrappedUCB),
+        ("LM_BootstrappedTS", LM_BootstrappedTS),
+    ]
+    specs = [PolicySpec(name, "bandit", (lambda s, c=cls: c(d, s)), group=CS_GROUP)
+             for name, cls in cs]
+    # The 0/1 reward never involves C_a, so these decisions are the same at
+    # every C_a: computed once, re-scored per C_a in the cost sweep.
+    specs += [PolicySpec(name, "bandit", (lambda s, c=cls: c(seed=s)), group=LM_GROUP,
+                         training_depends_on_C_a=False)
+              for name, cls in lm]
+    return specs
 
-    for model_name, train_fn, eval_fn in model_fns:
-        y_test, amounts_test, p_fraud = train_fn()
-        metrics = eval_fn(y_test, amounts_test, p_fraud, C_a=C_A, mode=THRESHOLD_MODE_PRIMARY)
-        results[model_name] = metrics
-        print(f"  [Group 3: Supervised Learning] {model_name} trained + evaluated")
 
-    return results, y_test
+def supervised_specs():
+    return [LogisticRegression.spec(), RandomForest.spec(), XGBoost.spec()]
 
 
-# ------------------------------------------------------------------
-# Summarization
-# ------------------------------------------------------------------
-def summarize_bandit_group(logs, y_test, conversion_type):
-    """Builds one summary row per policy from a bandit group's logs:
-    Precision/Recall/F1/AUPRC (AUPRC only if a 'score' array is present)
-    plus decision-quality metrics -- consistent shape across all groups."""
-    rows = []
-    for name, log in logs.items():
-        y_pred = log["action"]
-        y_score = log.get("score")  # None for Group 2 -- see run_label_matching_bandits()
-        cls = classification_metrics(y_test, y_pred, y_score=y_score)
-        dq = decision_quality_metrics(y_test, y_pred, log["reward"], log["regret"])
-        row = {"policy": name, "conversion_type": conversion_type, **cls, **dq}
-        if "native_training_reward" in log:
-            row["native_training_reward"] = log["native_training_reward"].sum()
-        rows.append(row)
-    return rows
+def _selected(name, fragments):
+    return not fragments or any(f in name for f in fragments)
+
+
+# =====================================================================
+# Running and exporting
+# =====================================================================
+def run_to_row(run, spec, conversion_type):
+    """One CSV row in the agreed layout. Deterministic policies run only
+    once, so their seed is left blank rather than showing an arbitrary one."""
+    m = run.metrics
+    return {
+        "policy": spec.name,
+        "conversion_type": conversion_type,
+        "seed": "" if spec.deterministic else run.seed,
+        **{k: m[k] for k in ("TP", "TN", "FP", "FN", "precision", "recall", "f1",
+                             "auprc", "cumulative_reward", "cumulative_regret")},
+    }
 
 
 def main():
-    print("=== main.py: Full Contextual Bandits vs. Supervised Learning Comparison ===\n")
+    parser = argparse.ArgumentParser(description="Goal 1 + Goal 2 main comparison.")
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS),
+                        help="seeds to run (default: all from config)")
+    parser.add_argument("--policies", nargs="+", default=None,
+                        help="run only policies whose names contain one of these")
+    parser.add_argument("--no-cache", action="store_true",
+                        help="ignore and overwrite cached runs")
+    args = parser.parse_args()
 
-    df = load_preprocessed_data()
-    if MAIN_SAMPLE_SIZE is not None:
-        df = df.sample(n=min(MAIN_SAMPLE_SIZE, len(df)), random_state=RANDOM_SEED)
-        df = df.sort_values("Time").reset_index(drop=True)
+    config.ensure_directories()
+    data = prepare_data()
+    print("=== main.py: Contextual Bandits vs Supervised Learning ===")
+    print(data.summary())
+    print(f"C_a = ${C_A:g} | seeds = {args.seeds} | "
+          f"training-reward units = {config.REWARD_SCALE_MODE}\n")
 
-    train_df, test_df, split_idx = chronological_split(df)
-    mu, sigma = fit_standardizer(train_df, CONTEXT_FEATURE_COLS)
-    X = transform_features(df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=True)
-    y = df["Class"].values
-    amounts = df["Amount"].values
-    y_test = test_df["Class"].values
+    rows, notes = [], []
+    t_start = time.time()
+    run_kwargs = dict(seeds=args.seeds, C_a=C_A, use_cache=not args.no_cache, verbose=True)
 
-    print(f"Dataset: {len(df)} transactions ({split_idx} train / {len(df) - split_idx} test), "
-          f"{int(y.sum())} fraud total\n")
+    # ---- Track B: bandits (both conversion types) ---------------------
+    for spec in bandit_specs(data.n_features + 1):
+        if not _selected(spec.name, args.policies):
+            continue
+        print(f"[{spec.group}] {spec.name}")
+        for run in run_policy_all_seeds(spec, data, **run_kwargs):
+            rows.append(run_to_row(run, spec, spec.group))
+            if run.n_skipped_updates:
+                notes.append(f"{spec.name} seed {run.seed}: safety net skipped "
+                             f"{run.n_skipped_updates} of {run.n_updates + run.n_skipped_updates} updates")
 
-    print("--- Group 1: Contextual Bandits (Cost-Sensitive conversion) ---")
-    cs_logs = run_cost_sensitive_bandits(X, y, amounts, split_idx)
+    # ---- Track A: supervised models, both threshold modes -------------
+    for spec in supervised_specs():
+        if not _selected(spec.name, args.policies):
+            continue
+        print(f"[Supervised Learning] {spec.name}")
+        for mode in (THRESHOLD_MODE_PRIMARY, THRESHOLD_MODE_SECONDARY):
+            # Trained once per seed; the second threshold mode reuses the
+            # cached probabilities, so it costs almost nothing.
+            for run in run_policy_all_seeds(spec, data, threshold_mode=mode, **run_kwargs):
+                rows.append(run_to_row(run, spec, SL_GROUP[mode]))
 
-    print("\n--- Group 2: Contextual Bandits (0/1 Label-Matching conversion) ---")
-    lm_logs = run_label_matching_bandits(X, y, amounts, split_idx)
+    if not rows:
+        print("No policies matched --policies; nothing to do.")
+        return
 
-    print("\n--- Group 3: Supervised Learning ---")
-    sl_results, sl_y_test = run_supervised_learning()
-    if MAIN_SAMPLE_SIZE is None:
-        assert np.array_equal(y_test, sl_y_test), \
-            "Test-region labels must match across groups -- split logic diverged somewhere."
-    else:
-        print("  (Skipping cross-group label consistency check: MAIN_SAMPLE_SIZE is set, "
-              "so Group 3 -- which always trains on the FULL dataset by design, since "
-              "subsampling classifier training would undermine the point of using the "
-              "full training set -- will have a different test region than the "
-              "subsampled bandit groups. This check only applies to full-scale runs.)")
+    # ---- Export (exact column orders) ---------------------------------
+    results = pd.DataFrame(rows)[RESULT_COLUMNS]
+    summary = summarize_runs(results, ID_COLUMNS, VALUE_COLUMNS)
+    results.to_csv(RESULTS_CSV, index=False)
+    summary.to_csv(SUMMARY_CSV, index=False)
 
-    # ------------------------------------------------------------------
-    # Combine everything into ONE master results table
-    # ------------------------------------------------------------------
-    all_rows = []
-    all_rows += summarize_bandit_group(cs_logs, y_test, "Cost-Sensitive")
-    if lm_logs:
-        all_rows += summarize_bandit_group(lm_logs, y_test, "0/1 Label-Matching")
-    for name, metrics in sl_results.items():
-        all_rows.append({"policy": name, "conversion_type": "Supervised Learning", **metrics})
-
-    results_df = pd.DataFrame(all_rows).sort_values("cumulative_reward", ascending=False)
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
-    results_df.to_csv(RESULTS_DIR / "main_results.csv", index=False)
-
-    print("\n=== Final Master Results (sorted by cumulative reward) ===")
-    display_cols = ["policy", "conversion_type", "cumulative_reward", "cumulative_regret",
-                     "fraud_catch_rate", "false_block_rate", "precision", "recall", "f1", "auprc"]
-    print(results_df[display_cols].to_string(index=False))
-
-    # ------------------------------------------------------------------
-    # Plot: cumulative reward, one horizontal bar per policy, colored by
-    # conversion type -- the headline Gap 1 comparison chart.
-    # ------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(11, 7))
-    colors = {"Cost-Sensitive": "steelblue", "0/1 Label-Matching": "indianred",
-              "Supervised Learning": "seagreen"}
-    bar_colors = [colors.get(ct, "gray") for ct in results_df["conversion_type"]]
-    ax.barh(results_df["policy"], results_df["cumulative_reward"], color=bar_colors)
-    ax.set_xlabel("Cumulative Reward ($, unified cost-sensitive evaluation)")
-    ax.set_title("Gap 1: Contextual Bandits vs. Supervised Learning\n"
-                  "(every policy re-scored under one shared cost-sensitive ledger)")
-    legend_elements = [Patch(facecolor=c, label=ct) for ct, c in colors.items()]
-    ax.legend(handles=legend_elements, loc="lower right")
-    ax.grid(alpha=0.3, axis="x")
-    plt.tight_layout()
-    plt.savefig(GRAPHS_DIR / "main_results_comparison.png", dpi=150)
-
-    print(f"\nSaved: {RESULTS_DIR / 'main_results.csv'}")
-    print(f"Saved: {GRAPHS_DIR / 'main_results_comparison.png'}")
+    # ---- Console overview ---------------------------------------------
+    view = summary[ID_COLUMNS + ["n_seeds", "cumulative_reward_mean",
+                                 "cumulative_reward_std", "f1_mean", "auprc_mean"]]
+    view = view.sort_values("cumulative_reward_mean", ascending=False)
+    print("\n=== Summary, best first (reward: closer to 0 is better) ===")
+    with pd.option_context("display.width", 160, "display.max_columns", 20,
+                           "display.float_format", "{:,.3f}".format):
+        print(view.to_string(index=False))
+    if notes:
+        print("\nNotes:")
+        for n in notes:
+            print("  " + n)
+    print(f"\nSaved {RESULTS_CSV}")
+    print(f"Saved {SUMMARY_CSV}")
+    print(f"Total time: {(time.time() - t_start) / 60:.1f} min")
 
 
 if __name__ == "__main__":

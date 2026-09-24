@@ -1,76 +1,93 @@
 """
-diagnose_label_matching.py
+diagnose_lints.py  (temporary -- delete once LinTS is fixed)
 
-Fast, standalone sanity check for all 5 Contextual_Bandits/LabelMatching01/
-classes: construction + one tiny select_actions/update cycle on dummy
-data. Runs in SECONDS, not minutes -- use this to catch any remaining
-constructor/API issues BEFORE running the full main.py (which takes
-several minutes just to reach Group 2).
-
+The library's LinTS blocked ~50% of transactions with near-random AUPRC,
+while LinUCB (same library, same data, same bias column) worked well.
+This script changes ONE suspect setting at a time to find the cause.
 Run from the project root:
-    python diagnose_label_matching.py
 
-Delete this file once you've confirmed everything passes -- it's a
-debugging aid, not part of the permanent project structure.
+    python diagnose_lints.py
+
+For each variant it reports:
+  block %       -- ~50% means coin-flip decisions
+  AUPRC         -- near the fraud rate means the scores carry no signal
+  signal/noise  -- how far apart the two arms' predictions are, relative to
+                   the randomness of the posterior draws (median over rows).
+                   Below 1 means the random draw drowns out what the model
+                   has learned; well above 1 means the model is in control.
 """
 
 import numpy as np
-import traceback
+from contextualbandits.online import LinTS as LibLinTS
 
-CLASSES = [
-    ("EpsilonGreedy", "Contextual_Bandits.LabelMatching01.EpsilonGreedy", "EpsilonGreedy"),
-    ("LinUCB", "Contextual_Bandits.LabelMatching01.LinUCB", "LinUCB"),
-    ("LinTS", "Contextual_Bandits.LabelMatching01.LinTS", "LinTS"),
-    ("BootstrappedUCB", "Contextual_Bandits.LabelMatching01.BootstrappedUCB", "BootstrappedUCB"),
-    ("BootstrappedTS", "Contextual_Bandits.LabelMatching01.BootstrappedTS", "BootstrappedTS"),
-]
+from Common.config import LINTS_V_SQ, RIDGE_LAMBDA, BLOCK, APPROVE
+from Common.runner import PolicySpec, run_policy
+from check import make_fake_data
 
-n_features = 32  # matches CONTEXT_FEATURE_COLS + bias in the real pipeline
-rng = np.random.default_rng(0)
-X_dummy = rng.normal(0, 1, size=(20, n_features))
-y_dummy = rng.integers(0, 2, size=20)
+BASE = dict(nchoices=2, lambda_=RIDGE_LAMBDA, fit_intercept=False, v_sq=LINTS_V_SQ,
+            sample_from="coef", sample_unique=True, use_float=False, method="chol",
+            beta_prior=None, njobs=1)
 
-print("=== LabelMatching01 diagnostic ===\n")
-all_passed = True
+# name -> (keyword overrides, whether the policy gets our bias column)
+VARIANTS = {
+    "current settings":            ({}, True),
+    "method='sm' (as LinUCB)":     ({"method": "sm"}, True),
+    "library intercept, no bias":  ({"fit_intercept": True}, False),
+    "sample_from='ci'":            ({"sample_from": "ci"}, True),
+    "v_sq = 0.0001 (tiny noise)":  ({"v_sq": 1e-4}, True),
+    "library defaults only":       ({"fit_intercept": True, "v_sq": 1.0,
+                                     "method": "chol", "use_float": False}, False),
+}
 
-for label, module_path, class_name in CLASSES:
-    print(f"--- {label} ---")
-    try:
-        module = __import__(module_path, fromlist=[class_name])
-        cls = getattr(module, class_name)
 
-        policy = cls(n_arms=2)
-        print(f"  construction: OK")
+def make_adapter(overrides, uses_bias):
+    class Adapter:
+        update_mode = "batch"
+        reward_type = "label_matching"
+        needs_both_arms = False
 
-        actions = policy.select_actions(X_dummy)
-        print(f"  select_actions: OK (actions={np.asarray(actions)[:5]}...)")
+        def __init__(self, seed):
+            self.uses_bias = uses_bias
+            self.policy = LibLinTS(**{**BASE, **overrides}, random_state=seed)
 
-        rewards = (np.asarray(actions) == y_dummy).astype(float)  # 0/1 reward
-        policy.update(X_dummy, actions, rewards)
-        print(f"  update: OK")
+        def select_actions(self, X):
+            return np.asarray(self.policy.predict(X)).astype(int)
 
-        # Second round, to confirm partial_fit (not just the first .fit()) works
-        actions2 = policy.select_actions(X_dummy)
-        rewards2 = (np.asarray(actions2) == y_dummy).astype(float)
-        policy.update(X_dummy, actions2, rewards2)
-        print(f"  second update (partial_fit path): OK")
+        def update(self, X, a, r):
+            self.policy.partial_fit(X, a, r)
 
-        # THIRD round: deliberately reproduce the real crash seen on the
-        # actual dataset -- force EVERY transaction in the batch to the
-        # SAME action (0 = Approve), which leaves the other arm with 0
-        # samples internally. This should now be caught and skipped
-        # gracefully (printing a NOTE) rather than raising.
-        all_same_action = np.zeros(20, dtype=int)
-        rewards3 = (all_same_action == y_dummy).astype(float)
-        policy.update(X_dummy, all_same_action, rewards3)
-        print(f"  all-same-action batch (forced edge case): OK (handled gracefully)")
+        def batch_scores(self, X):
+            s = np.asarray(self.policy.decision_function(X), dtype=float)
+            return s[:, BLOCK] - s[:, APPROVE]
+    return Adapter
 
-        print(f"  PASSED\n")
-    except Exception as e:
-        all_passed = False
-        print(f"  FAILED: {type(e).__name__}: {e}")
-        traceback.print_exc()
-        print()
 
-print("=== Summary ===")
-print("ALL 5 CLASSES PASSED" if all_passed else "ONE OR MORE CLASSES FAILED -- see above")
+def signal_to_noise(adapter_cls, data, n_draws=30):
+    """Train on the warm-up rows, then call decision_function repeatedly on
+    the same test rows: the mean over draws is the learned signal, the
+    spread across draws is the sampling noise."""
+    p = adapter_cls(seed=42)
+    X = data.X_bias if p.uses_bias else data.X
+    Xtr, ytr = X[:data.split_idx], data.y[:data.split_idx]
+    rng = np.random.default_rng(0)
+    a = rng.integers(0, 2, size=len(ytr))               # both arms get data
+    p.update(Xtr, a, (a == ytr).astype(float))
+    Xte = X[data.split_idx:data.split_idx + 300]
+    draws = np.array([p.batch_scores(Xte) for _ in range(n_draws)])
+    return float(np.median(np.abs(draws.mean(0)) / (draws.std(0) + 1e-12)))
+
+
+if __name__ == "__main__":
+    data = make_fake_data()
+    print(f"Synthetic data: fraud rate in test region {100 * data.y_test.mean():.1f}%\n")
+    print(f"{'variant':30s} {'block %':>8s} {'AUPRC':>7s} {'signal/noise':>13s}")
+    for name, (overrides, uses_bias) in VARIANTS.items():
+        try:
+            cls = make_adapter(overrides, uses_bias)
+            run = run_policy(PolicySpec(f"diag_{name}", "bandit", cls), data,
+                             seed=42, use_cache=False, verbose=False)
+            snr = signal_to_noise(cls, data)
+            print(f"{name:30s} {100 * run.actions.mean():>7.1f}% "
+                  f"{run.metrics['auprc']:>7.3f} {snr:>13.2f}")
+        except Exception as exc:
+            print(f"{name:30s} CRASHED: {type(exc).__name__}: {exc}")

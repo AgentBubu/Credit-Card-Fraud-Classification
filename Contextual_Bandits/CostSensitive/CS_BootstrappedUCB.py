@@ -1,114 +1,130 @@
 """
 Contextual_Bandits/CostSensitive/CS_BootstrappedUCB.py
 
-Custom cost-sensitive Bootstrapped UCB. The LabelMatching01 library
-version resamples binary CLASSIFIERS and therefore requires {0,1}
-rewards -- this version resamples LINEAR REGRESSORS so it can learn
-from continuous, dollar-valued cost-sensitive rewards (see
-Common/reward.py: cost_sensitive_reward).
+Cost-sensitive Bootstrapped UCB.
 
-Mechanism: "online bootstrap via random reweighting" (Owen, 2007).
-Storing full history and refitting n_bootstrap models from scratch
-every round would be far too slow at ~285k transactions. Instead, each
-incoming (x, r) pair updates EVERY bootstrap model's sufficient
-statistics with a random Poisson(1) weight instead of a fixed weight of
-1. Over many rounds this statistically approximates true
-resampling-with-replacement, while still allowing a fast O(d^2)
-incremental (weighted Sherman-Morrison) update per round -- the same
-trick used in CS_LinUCB.py / CS_LinTS.py, generalized to accept a
-per-update weight.
+What it learns
+--------------
+Exactly like CS_BootstrappedTS: for each arm (Approve, Block), an
+ENSEMBLE of N linear models, each estimating the DOLLAR reward of that
+arm, Q(x, arm) = theta . x, trained on its own online-bootstrap resample
+(every update gets a random Poisson(1) weight). Rewards are continuous
+dollars from the shared cost matrix, which is why this is a custom
+implementation rather than the contextualbandits library version (that
+one only accepts 0/1 rewards).
 
-At each round, the ensemble's UPPER PERCENTILE of predicted reward
-(across bootstrap models, per arm) is used as an empirical,
-optimism-under-uncertainty score: wide disagreement across bootstrap
-models signals uncertainty, which pushes the percentile score up and
-encourages exploring that arm.
+How it explores -- the only difference from Bootstrapped TS
+------------------------------------------------------------
+Thompson Sampling picks ONE random ensemble member per arm (randomised
+exploration). Bootstrapped UCB instead looks at ALL members and scores
+each arm by an UPPER PERCENTILE of their predictions (the 80th by
+default). When the ensemble disagrees about an arm, that percentile sits
+well above the average, making the arm look optimistically good and
+worth trying -- "optimism in the face of uncertainty". As the members
+converge, the percentile approaches the mean and exploration fades on
+its own.
 
-PER-TRANSACTION INTERFACE: select_action(x) / update(x, arm, r), same
-as the other CostSensitive/ files.
+Given a trained ensemble, the choice is deterministic; randomness enters
+only through the bootstrap weights and tie-breaking.
+
+Contract (see Common/runner.py)
+-------------------------------
+update_mode = "online", reward_type = "cost_sensitive", uses_bias = True
+select_action(x), update(x, action, reward), predict_score(x)
 """
 
 import numpy as np
 
-from Common.config import RANDOM_SEED, N_BOOTSTRAP, BOOTSTRAPPED_UCB_PERCENTILE, RIDGE_LAMBDA
-
-
-def _weighted_sherman_morrison_update(A_inv, x, w):
-    """Incrementally update A_inv given A_new = A + w * x x^T, in O(d^2).
-    w=1 reduces to the standard (unweighted) Sherman-Morrison update."""
-    if w == 0:
-        return A_inv
-    Ax = A_inv @ x
-    denom = 1.0 + w * (x @ Ax)
-    return A_inv - w * np.outer(Ax, Ax) / denom
+from Common.config import (
+    APPROVE, BLOCK, N_ARMS, N_BOOTSTRAP, BOOTSTRAPPED_UCB_PERCENTILE, RIDGE_LAMBDA,
+)
 
 
 class CS_BootstrappedUCB:
-    """Cost-sensitive Bootstrapped UCB using an ensemble of
-    online-bootstrapped linear regressors per arm, with an
-    upper-percentile exploration bonus (2 arms: 0=Approve, 1=Block)."""
+    # ---- runner contract ---------------------------------------------
+    update_mode = "online"
+    reward_type = "cost_sensitive"
+    uses_bias = True            # expects the context vector WITH the bias column
 
-    def __init__(self, n_arms=2, n_features=None, n_bootstrap=N_BOOTSTRAP,
-                 percentile=BOOTSTRAPPED_UCB_PERCENTILE, ridge=RIDGE_LAMBDA,
-                 seed=RANDOM_SEED):
-        if n_features is None:
-            raise ValueError("n_features must be provided (dimension of the "
-                              "context vector, including the bias term if used).")
-        self.n_arms = n_arms
-        self.n_features = n_features
-        self.n_bootstrap = n_bootstrap
+    # Re-symmetrise the stored inverse matrices every this many updates, to
+    # remove floating-point asymmetry that builds up over many rank-1 updates.
+    _SYMMETRISE_EVERY = 10_000
+
+    def __init__(self, n_features, seed, n_bootstrap=N_BOOTSTRAP,
+                 percentile=BOOTSTRAPPED_UCB_PERCENTILE, ridge=RIDGE_LAMBDA):
+        """
+        n_features  : length of the context vector (including the bias column)
+        seed        : random seed -- drives bootstrap weights and tie-breaking
+        n_bootstrap : ensemble size per arm
+        percentile  : which percentile of the ensemble's predictions is the
+                      arm's optimistic (UCB) score
+        ridge       : ridge regularisation (starting A = ridge * I)
+        """
+        self.d = n_features
+        self.n_boot = n_bootstrap
         self.percentile = percentile
         self.rng = np.random.default_rng(seed)
 
-        # One bootstrap ensemble of linear models PER ARM
-        self.A_inv = [
-            [np.eye(n_features) / ridge for _ in range(n_bootstrap)]
-            for _ in range(n_arms)
-        ]
-        self.b = [
-            [np.zeros(n_features) for _ in range(n_bootstrap)]
-            for _ in range(n_arms)
-        ]
+        # Stacked per-arm ensembles (see CS_BootstrappedTS for the layout):
+        #   A_inv[arm, k] (d x d), b[arm, k] (d,), theta[arm, k] = A_inv @ b
+        self.A_inv = np.tile(np.eye(n_features) / ridge, (N_ARMS, n_bootstrap, 1, 1))
+        self.b = np.zeros((N_ARMS, n_bootstrap, n_features))
+        self.theta = np.zeros((N_ARMS, n_bootstrap, n_features))
+        self._n_updates = 0
+
+    # ---- deciding -----------------------------------------------------
+    def _ucb_scores(self, x):
+        """Optimistic score per arm: the chosen upper percentile of the
+        ensemble's predicted dollar rewards. Shape (N_ARMS,)."""
+        preds = self.theta @ x                       # (N_ARMS, n_boot)
+        return np.percentile(preds, self.percentile, axis=1)
 
     def select_action(self, x):
-        """x: context vector for a single transaction (n_features,).
-        Returns the arm whose bootstrap-ensemble upper percentile of
-        predicted reward is highest."""
-        scores = np.zeros(self.n_arms)
-        for a in range(self.n_arms):
-            preds = np.array([
-                (self.A_inv[a][k] @ self.b[a][k]) @ x
-                for k in range(self.n_bootstrap)
-            ])
-            scores[a] = np.percentile(preds, self.percentile)
-        return int(np.argmax(scores))
+        """Play the arm with the highest optimistic (UCB) score."""
+        return self._argmax_random_ties(self._ucb_scores(x))
 
-    def update(self, x, arm, r):
-        """Incrementally update EVERY bootstrap model for the chosen arm,
-        each with an independent random Poisson(1) resampling weight.
+    def _argmax_random_ties(self, q):
+        """Break exact ties at random. Untrained models predict exactly 0 for
+        both arms; np.argmax would then always pick Approve and bias early
+        exploration (Bietti et al.'s bake-off recommends random tie-breaks)."""
+        best = np.flatnonzero(q == q.max())
+        return int(best[0]) if len(best) == 1 else int(self.rng.choice(best))
 
-        x:   context vector (n_features,)
-        arm: the action that was actually taken (0 or 1)
-        r:   realized reward for that action -- from
-             Common/reward.py: cost_sensitive_reward (continuous, dollars)
-        """
-        for k in range(self.n_bootstrap):
-            w = self.rng.poisson(1.0)  # online-bootstrap resampling weight
-            if w == 0:
-                continue
-            self.A_inv[arm][k] = _weighted_sherman_morrison_update(
-                self.A_inv[arm][k], x, w
-            )
-            self.b[arm][k] += w * r * x
+    # ---- learning -----------------------------------------------------
+    def update(self, x, action, reward):
+        """Update every ensemble member of the CHOSEN arm only, each with its
+        own Poisson(1) bootstrap weight. The unchosen arm learns nothing --
+        the partial (bandit) feedback limitation."""
+        w = self.rng.poisson(1.0, size=self.n_boot).astype(float)
+        if not w.any():
+            return                                  # every member drew weight 0
 
+        A_inv = self.A_inv[action]                  # (n_boot, d, d), a view
+        Ax = A_inv @ x                              # (n_boot, d)
+        denom = 1.0 + w * (Ax @ x)                  # (n_boot,)
+        # Weighted Sherman-Morrison:
+        #   (A + w x x^T)^-1 = A^-1 - w (A^-1 x)(A^-1 x)^T / (1 + w x^T A^-1 x)
+        A_inv -= (w / denom)[:, None, None] * (Ax[:, :, None] * Ax[:, None, :])
+        self.b[action] += (w * reward)[:, None] * x
+        self.theta[action] = np.einsum("kij,kj->ki", A_inv, self.b[action])
+
+        self._n_updates += 1
+        if self._n_updates % self._SYMMETRISE_EVERY == 0:
+            self.A_inv = 0.5 * (self.A_inv + np.swapaxes(self.A_inv, -1, -2))
+
+    # ---- scoring (for AUPRC only; never used to decide) ---------------
     def predict_score(self, x):
-        """Continuous score for the Block arm (arm 1), used ONLY for
-        AUPRC computation (Common/metrics.py). Uses the SAME
-        upper-percentile-of-ensemble score computed during action
-        selection.
+        """How strongly the policy prefers BLOCKING this transaction:
+            score = UCB(Block) - UCB(Approve)
+        Higher = more fraud-like, which is what AUPRC needs. For a UCB
+        method, the natural ranking score is the same optimistic score it
+        uses to decide.
+
+        Why a difference and not UCB(Block) alone: blocking ALWAYS costs
+        C_a, fraud or not, so the Block arm learns roughly a constant and
+        cannot rank transactions; the fraud information lives in the
+        Approve arm. An earlier version scored with the Block arm alone,
+        which made its AUPRC close to meaningless.
         """
-        preds = np.array([
-            (self.A_inv[1][k] @ self.b[1][k]) @ x
-            for k in range(self.n_bootstrap)
-        ])
-        return float(np.percentile(preds, self.percentile))
+        ucb = self._ucb_scores(x)
+        return float(ucb[BLOCK] - ucb[APPROVE])

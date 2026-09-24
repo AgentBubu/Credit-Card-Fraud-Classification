@@ -1,86 +1,116 @@
 """
 Contextual_Bandits/CostSensitive/CS_LinUCB.py
 
-Custom cost-sensitive LinUCB (Li et al., 2010), adapted to learn from
-continuous, dollar-valued rewards (see Common/reward.py:
-cost_sensitive_reward) rather than the binary {0,1} rewards the
-LabelMatching01 library version requires.
+Cost-sensitive LinUCB (disjoint version; Li et al., 2010).
 
-Mechanism: maintains a ridge-regression linear model per arm, updated
-incrementally via Sherman-Morrison (O(d^2) per transaction, no full
-matrix inversion needed each round). Action choice adds an "optimism
-under uncertainty" bonus on top of the predicted reward:
+What it learns
+--------------
+For each arm (Approve, Block), a ridge-regression estimate of the DOLLAR
+reward that arm earns in a given context:
+    theta_hat = A^-1 b,   A = ridge*I + sum x x^T,   b = sum reward * x
+over the rounds that arm was played. Rewards are continuous dollars from
+the shared cost matrix, hence a custom implementation (the
+contextualbandits library only accepts 0/1 rewards).
 
-    score(arm) = theta_arm . x  +  alpha * sqrt(x^T A_inv_arm x)
+How it explores
+---------------
+"Optimism in the face of uncertainty": each arm is scored by its
+predicted reward PLUS an uncertainty bonus,
+    UCB(x, arm) = theta_hat_arm . x  +  alpha * sqrt(x^T A_arm^-1 x)
+and the arm with the higher score is played. The bonus is large for
+contexts unlike anything the arm has seen, so unfamiliar situations get
+explored; it shrinks as data accumulates, so exploration fades on its
+own. Unlike Thompson Sampling, the choice is deterministic given the
+data -- randomness enters only through tie-breaking.
 
-The bonus term shrinks automatically as an arm accumulates more
-relevant data (A_inv shrinks), which is what makes LinUCB's exploration
-ADAPTIVE -- unlike Epsilon-Greedy's fixed exploration rate, LinUCB
-explores less over time on arms/contexts it has already learned well,
-and continues exploring on ones it hasn't.
+Note on scale: the bonus alpha * sqrt(x^T A^-1 x) does not grow with the
+size of the rewards, while the predicted rewards do. With dollar rewards,
+the same alpha therefore produces much less exploration than with 0/1
+rewards. See the discussion around CS_LinTS -- the same applies here.
 
-PER-TRANSACTION INTERFACE: select_action(x) / update(x, arm, r), same
-as CS_EpsilonGreedy.py -- see that file's docstring for why no batching
-is needed for this implementation.
+Contract (see Common/runner.py)
+-------------------------------
+update_mode = "online", reward_type = "cost_sensitive", uses_bias = True
+select_action(x), update(x, action, reward), predict_score(x)
 """
 
 import numpy as np
 
-from Common.config import RANDOM_SEED, LINUCB_ALPHA, RIDGE_LAMBDA
+from Common.config import APPROVE, BLOCK, N_ARMS, LINUCB_ALPHA, RIDGE_LAMBDA
 
 
 class CS_LinUCB:
-    """Cost-sensitive LinUCB (2 arms: 0=Approve, 1=Block)."""
+    # ---- runner contract ---------------------------------------------
+    update_mode = "online"
+    reward_type = "cost_sensitive"
+    uses_bias = True            # expects the context vector WITH the bias column
 
-    def __init__(self, n_arms=2, n_features=None, alpha=LINUCB_ALPHA,
-                 ridge=RIDGE_LAMBDA, seed=RANDOM_SEED):
-        if n_features is None:
-            raise ValueError("n_features must be provided (dimension of the "
-                              "context vector, including the bias term if used).")
-        self.n_arms = n_arms
+    # Re-symmetrise the stored inverse matrices every this many updates, to
+    # remove floating-point asymmetry that builds up over many rank-1 updates.
+    _SYMMETRISE_EVERY = 10_000
+
+    def __init__(self, n_features, seed, alpha=LINUCB_ALPHA, ridge=RIDGE_LAMBDA):
+        """
+        n_features : length of the context vector (including the bias column)
+        seed       : random seed -- used only for tie-breaking (LinUCB is
+                     otherwise deterministic)
+        alpha      : width of the optimism bonus; larger = more exploration
+        ridge      : ridge regularisation (starting A = ridge * I)
+        """
+        self.d = n_features
         self.alpha = alpha
-        self.A_inv = [np.eye(n_features) / ridge for _ in range(n_arms)]
-        self.b = [np.zeros(n_features) for _ in range(n_arms)]
-        # seed kept for interface consistency with the other CS_ classes;
-        # LinUCB's action choice is otherwise deterministic given the data.
         self.rng = np.random.default_rng(seed)
 
+        # Per arm: A_inv (d x d), b (d,), theta = A_inv @ b
+        self.A_inv = np.tile(np.eye(n_features) / ridge, (N_ARMS, 1, 1))
+        self.b = np.zeros((N_ARMS, n_features))
+        self.theta = np.zeros((N_ARMS, n_features))
+        self._n_updates = 0
+
+    # ---- deciding -----------------------------------------------------
+    def _ucb_scores(self, x):
+        """Predicted reward + uncertainty bonus, per arm. Shape (N_ARMS,)."""
+        mean = self.theta @ x
+        var = np.einsum("aij,i,j->a", self.A_inv, x, x)     # x^T A^-1 x per arm
+        return mean + self.alpha * np.sqrt(np.maximum(var, 0.0))
+
     def select_action(self, x):
-        """x: context vector for a single transaction (n_features,).
-        Returns the chosen arm (0=Approve, 1=Block): the one with the
-        highest upper-confidence-bound score."""
-        scores = np.zeros(self.n_arms)
-        for a in range(self.n_arms):
-            A_inv = self.A_inv[a]
-            theta = A_inv @ self.b[a]
-            mean_reward = theta @ x
-            uncertainty_bonus = self.alpha * np.sqrt(x @ A_inv @ x)
-            scores[a] = mean_reward + uncertainty_bonus
-        return int(np.argmax(scores))
+        """Play the arm with the highest optimistic (UCB) score."""
+        return self._argmax_random_ties(self._ucb_scores(x))
 
-    def update(self, x, arm, r):
-        """Incrementally update the chosen arm's linear model with this
-        single transaction's (context, realized reward) pair.
+    def _argmax_random_ties(self, q):
+        """Break exact ties at random. Before any learning both arms score
+        identically; np.argmax would then always pick Approve (Bietti et
+        al.'s bake-off recommends random tie-breaking)."""
+        best = np.flatnonzero(q == q.max())
+        return int(best[0]) if len(best) == 1 else int(self.rng.choice(best))
 
-        x:   context vector (n_features,)
-        arm: the action that was actually taken (0 or 1)
-        r:   realized reward for that action -- from
-             Common/reward.py: cost_sensitive_reward (continuous, dollars)
+    # ---- learning -----------------------------------------------------
+    def update(self, x, action, reward):
+        """Update the CHOSEN arm's model only (partial / bandit feedback),
+        with one Sherman-Morrison step:
+            (A + x x^T)^-1 = A^-1 - (A^-1 x)(A^-1 x)^T / (1 + x^T A^-1 x)
         """
-        A_inv = self.A_inv[arm]
+        A_inv = self.A_inv[action]                       # (d, d), a view
         Ax = A_inv @ x
-        denom = 1.0 + x @ Ax
-        self.A_inv[arm] = A_inv - np.outer(Ax, Ax) / denom  # Sherman-Morrison
-        self.b[arm] += r * x
+        A_inv -= np.outer(Ax, Ax) / (1.0 + x @ Ax)
+        self.b[action] += reward * x
+        self.theta[action] = A_inv @ self.b[action]
 
+        self._n_updates += 1
+        if self._n_updates % self._SYMMETRISE_EVERY == 0:
+            self.A_inv = 0.5 * (self.A_inv + np.swapaxes(self.A_inv, -1, -2))
+
+    # ---- scoring (for AUPRC only; never used to decide) ---------------
     def predict_score(self, x):
-        """Continuous score for the Block arm (arm 1), used ONLY for
-        AUPRC computation (Common/metrics.py). Uses the SAME UCB score
-        (mean prediction + uncertainty bonus) computed during action
-        selection -- this is the natural ranking score for LinUCB.
+        """How strongly the policy prefers BLOCKING:
+            score = UCB(x, Block) - UCB(x, Approve)
+        Higher = more fraud-like. For a UCB method, the natural ranking
+        score is the same optimistic score it decides with.
+
+        Why a difference and not UCB(Block) alone: blocking ALWAYS costs
+        C_a, so the Block arm learns roughly a constant and cannot rank
+        transactions; the fraud information lives in the Approve arm.
         """
-        A_inv = self.A_inv[1]
-        theta = A_inv @ self.b[1]
-        mean_reward = theta @ x
-        uncertainty_bonus = self.alpha * np.sqrt(x @ A_inv @ x)
-        return float(mean_reward + uncertainty_bonus)
+        ucb = self._ucb_scores(x)
+        return float(ucb[BLOCK] - ucb[APPROVE])

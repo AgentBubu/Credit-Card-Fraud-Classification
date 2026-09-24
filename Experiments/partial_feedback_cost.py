@@ -1,316 +1,219 @@
 """
 Experiments/partial_feedback_cost.py
 
-GAP 4c: Quantifying the cost of PARTIAL FEEDBACK.
+Experiment 2 -- The cost of partial feedback
 
-Decomposes the reward gap between four policy families, all evaluated
-on the SAME held-out TEST region (for a fair, apples-to-apples
-comparison):
+Question
+--------
+Why aren't the bandits perfect? Two structural handicaps are easy to mix
+up, so this experiment measures them separately, each against the same
+reference policy -- Full-Info Online (Experiments/reference_policies.py),
+which keeps learning through the whole stream like a bandit, but is told
+the TRUE LABEL after every transaction like a supervised model:
 
-    Oracle  >=  FullInfoOnline  >=  CS_ bandits (5x, partial feedback)
-                     |
-                     |  (also compared against:)
-                     v
-              Batch SL models (3x, frozen after training)
+    clean cost of partial feedback = reward(Full-Info) - reward(Partial-Info)
+        Partial-Info Online is Full-Info Online's exact twin (same model,
+        same threshold) that learns only from transactions it APPROVED --
+        under the cost matrix, blocking reveals nothing. ONLY the feedback
+        differs. It has no exploration, so this is what partial feedback
+        costs when nothing is done about it.
 
-  - ORACLE: upper bound. Cheats -- knows the true label in advance.
-    Used only to compute regret, never as a realistic baseline.
-  - FULL-INFORMATION ONLINE (FullInformationOnlineLearner, below): a
-    single online model, updated on the TRUE LABEL after EVERY
-    transaction -- not just the reward for whichever action it actually
-    took. Still online (keeps adapting through the whole stream), but
-    unlike a bandit, it's simply told the truth every round instead of
-    having to infer it indirectly.
-  - CONTEXTUAL BANDITS (Contextual_Bandits/CostSensitive/CS_*.py):
-    online, but see ONLY the reward for the action actually taken --
-    true partial/bandit feedback.
-  - BATCH SUPERVISED LEARNING (Supervised_Learning/*.py): full
-    information, but only from the TRAIN region -- frozen thereafter,
-    never adapts during the test region at all.
+    bandit gap                     = reward(Full-Info) - reward(bandit)
+        The bandits also get partial feedback, but EXPLORE to counter it
+        (and model the decision differently). The share of the clean loss
+        each bandit recovers shows what its exploration buys:
+            recovered = (bandit - Partial-Info) / (Full-Info - Partial-Info)
 
-This lets us isolate and report two separate "costs" rather than one
-vague "bandits are harder" claim:
+    cost of being frozen           = reward(Full-Info) - reward(supervised)
+        Both learn from true labels; only CONTINUED LEARNING differs.
+        (A supervised model is trained once and never updated.)
 
-    cost_of_partial_feedback = reward(FullInfoOnline) - reward(bandit)
-        (both online; isolates the cost of PARTIAL feedback specifically)
+Positive = the handicap costs money; negative = the policy beat the
+reference despite it. The Oracle (cost-optimal with perfect knowledge) is
+included for scale -- every policy's regret is its gap to the Oracle --
+but is NOT used for the decomposition, because that gap also contains the
+ordinary cost of having to learn at all.
 
-    cost_of_being_frozen = reward(FullInfoOnline) - reward(batch SL)
-        (both eventually see true labels; isolates the cost of NEVER
-         adapting during the test region)
+Policies (all at one C_a, default $10, scored on the same test region)
+----------------------------------------------------------------------
+  Oracle                       family "Oracle"
+  Full-Info Online             family "Full-Info Online"
+  Partial-Info Online          family "Partial-Info Online"
+  5 cost-sensitive bandits     family "Bandit (partial feedback)"
+  3 supervised models          family "Supervised (frozen)"  -- PRIMARY
+                               (dynamic) threshold, the same decision rule
+                               Full-Info Online uses
+
+Cost-sensitive bandits are used (not the 0/1 ones) because they, like
+Full-Info Online, are aiming at the dollar objective; comparing a 0/1
+bandit with Full-Info Online would mix reward design into the gap.
+
+Why Partial-Info Online is needed: Full-Info Online is a logistic model of
+P(fraud) plus the dynamic threshold, while the cost-sensitive bandits
+learn dollar costs with linear models, so the plain bandit gap mixes
+feedback with model form (Experiment 1 showed model form matters). The
+Partial-Info twin isolates the feedback exactly.
+
+Nearly everything here is already cached by main.py (all bandits and
+supervised models at C_a = $10); only the three reference policies are
+new, and all are fast and deterministic.
+
+Outputs
+-------
+  Results/partial_feedback_results.csv   one row per policy per seed:
+      policy, family, seed, TP, TN, FP, FN,
+      precision, recall, f1, auprc, cumulative_reward, cumulative_regret
+  Results/partial_feedback_summary.csv   one row per policy: n_seeds, then
+      the mean and std of every numeric column (std blank for single runs)
+  The decomposition itself is printed to the console.
+
+Usage
+-----
+  python -m Experiments.partial_feedback_cost
+  python -m Experiments.partial_feedback_cost --seeds 42 --policies CS_ XGBoost
 """
 
-import numpy as np
+import argparse
+import time
+
 import pandas as pd
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 
-from Common.config import (
-    RANDOM_SEED, C_A, RIDGE_LAMBDA, CONTEXT_FEATURE_COLS,
-    GRAPHS_DIR, RESULTS_DIR, THRESHOLD_MODE_PRIMARY,
+from Common import config
+from Common.config import C_A, RESULTS_DIR, SEEDS, THRESHOLD_MODE_PRIMARY
+from Common.metrics import summarize_runs
+from Common.preprocessing import prepare_data
+from Common.runner import run_policy_all_seeds
+from Experiments.reference_policies import (
+    oracle_spec, full_info_online_spec, partial_info_online_spec,
 )
-from Common.preprocessing import load_preprocessed_data, chronological_split, fit_standardizer, transform_features
-from Common.reward import cost_sensitive_reward, oracle_cost_sensitive_reward, oracle_action, probability_to_action
 
-from Contextual_Bandits.CostSensitive.CS_EpsilonGreedy import CS_EpsilonGreedy
-from Contextual_Bandits.CostSensitive.CS_LinUCB import CS_LinUCB
-from Contextual_Bandits.CostSensitive.CS_LinTS import CS_LinTS
-from Contextual_Bandits.CostSensitive.CS_BootstrappedUCB import CS_BootstrappedUCB
-from Contextual_Bandits.CostSensitive.CS_BootstrappedTS import CS_BootstrappedTS
+# Re-use main.py's policy definitions, so every script runs the same policies.
+from main import bandit_specs, supervised_specs, _selected, CS_GROUP
 
-from Supervised_Learning.LogisticRegression import (
-    train_and_predict as lr_train_and_predict, evaluate_at_threshold as lr_evaluate,
-)
-from Supervised_Learning.RandomForest import (
-    train_and_predict as rf_train_and_predict, evaluate_at_threshold as rf_evaluate,
-)
-try:
-    from Supervised_Learning.XGBoost import (
-        train_and_predict as xgb_train_and_predict, evaluate_at_threshold as xgb_evaluate,
-    )
-    _HAS_XGBOOST = True
-except ImportError:
-    _HAS_XGBOOST = False
+RESULT_COLUMNS = [
+    "policy", "family", "seed", "TP", "TN", "FP", "FN",
+    "precision", "recall", "f1", "auprc", "cumulative_reward", "cumulative_regret",
+]
+ID_COLUMNS = ["policy", "family"]
+VALUE_COLUMNS = RESULT_COLUMNS[3:]
+
+FAMILY_ORACLE = "Oracle"
+FAMILY_FULL_INFO = "Full-Info Online"
+FAMILY_PARTIAL_INFO = "Partial-Info Online"
+FAMILY_BANDIT = "Bandit (partial feedback)"
+FAMILY_FROZEN = "Supervised (frozen)"
+
+RESULTS_CSV = RESULTS_DIR / "partial_feedback_results.csv"
+SUMMARY_CSV = RESULTS_DIR / "partial_feedback_summary.csv"
 
 
-# Optional subsample for compute-constrained environments/quick testing.
-# None = use the full ~285k-row dataset (recommended for final results).
-PARTIAL_FEEDBACK_SAMPLE_SIZE = None
-
-
-class FullInformationOnlineLearner:
-    """A single online linear-probability model (NOT per-arm -- there's
-    only ONE thing being predicted: P(fraud) from context), updated via
-    incremental (Sherman-Morrison) ridge regression on the TRUE LABEL
-    after every transaction, regardless of which action was actually
-    taken. This is what makes it "full information": it's simply told
-    the truth every round, rather than having to infer it indirectly the
-    way a bandit does.
-
-    DESIGN NOTE: this fits a LINEAR probability model (regressing
-    y in {0,1} via ridge regression), not true online logistic
-    regression -- chosen to stay consistent with the same closed-form
-    Sherman-Morrison technique used throughout Contextual_Bandits/
-    CostSensitive/. A true incremental logistic regression has no
-    equivalent closed-form update (would need SGD instead), which would
-    make this baseline harder to compare apples-to-apples against the
-    linear bandits it's meant to be judged alongside. Predicted
-    probabilities are clipped to [0, 1] since a linear model has no
-    such built-in guarantee.
-    """
-
-    def __init__(self, n_features, ridge=RIDGE_LAMBDA):
-        self.A_inv = np.eye(n_features) / ridge
-        self.b = np.zeros(n_features)
-
-    def predict_proba(self, x):
-        theta = self.A_inv @ self.b
-        return float(np.clip(theta @ x, 0.0, 1.0))
-
-    def select_action(self, x, amount, C_a=C_A):
-        p_fraud = self.predict_proba(x)
-        return probability_to_action(p_fraud, amount, mode=THRESHOLD_MODE_PRIMARY, C_a=C_a)
-
-    def update(self, x, true_label):
-        """Updates on the TRUE LABEL every round -- the key difference
-        from a bandit's update(x, arm, r), which only ever sees the
-        reward for the action it actually took."""
-        Ax = self.A_inv @ x
-        denom = 1.0 + x @ Ax
-        self.A_inv = self.A_inv - np.outer(Ax, Ax) / denom  # Sherman-Morrison
-        self.b += true_label * x
-
-
-def _make_bandit_policies(n_features):
+def run_to_row(run, spec, family):
+    m = run.metrics
     return {
-        "CS_EpsilonGreedy": CS_EpsilonGreedy(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinUCB": CS_LinUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_LinTS": CS_LinTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedUCB": CS_BootstrappedUCB(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
-        "CS_BootstrappedTS": CS_BootstrappedTS(n_arms=2, n_features=n_features, seed=RANDOM_SEED),
+        "policy": spec.name,
+        "family": family,
+        "seed": "" if spec.deterministic else run.seed,
+        **{k: m[k] for k in ("TP", "TN", "FP", "FN", "precision", "recall", "f1",
+                             "auprc", "cumulative_reward", "cumulative_regret")},
     }
 
 
-def run_online_stream():
-    """Streams the dataset chronologically ONCE, running the Oracle,
-    FullInformationOnlineLearner, and all 5 CS_ bandits simultaneously.
-    Train region = warm-up, test region = the fair evaluation window --
-    same convention established in main.py / earlier project work.
+# =====================================================================
+# Console report: the decomposition
+# =====================================================================
+def report(summary, C_a):
+    r = summary.set_index("policy")
+    print(f"\n=== All policies at C_a = ${C_a:g}, best first ===")
+    view = summary[["policy", "family", "n_seeds", "cumulative_reward_mean",
+                    "cumulative_reward_std", "cumulative_regret_mean"]]
+    with pd.option_context("display.width", 160, "display.float_format", "{:,.2f}".format):
+        print(view.sort_values("cumulative_reward_mean", ascending=False).to_string(index=False))
 
-    Returns: logs (dict: policy_name -> {'reward', 'regret', 'action'}
-    arrays, TEST region only), y_test, amounts_test
-    """
-    df = load_preprocessed_data()
-    if PARTIAL_FEEDBACK_SAMPLE_SIZE is not None:
-        df = df.sample(n=min(PARTIAL_FEEDBACK_SAMPLE_SIZE, len(df)), random_state=RANDOM_SEED)
-        df = df.sort_values("Time").reset_index(drop=True)
+    if "FullInfoOnline" not in r.index:
+        print("\n(Full-Info Online was not run, so the decomposition is skipped.)")
+        return
+    ref = r.loc["FullInfoOnline", "cumulative_reward_mean"]
+    print(f"\nReference: Full-Info Online reward = ${ref:,.2f}")
 
-    train_df, test_df, split_idx = chronological_split(df)
-    mu, sigma = fit_standardizer(train_df, CONTEXT_FEATURE_COLS)
-    X = transform_features(df, mu, sigma, CONTEXT_FEATURE_COLS, add_bias=True)
-    y = df["Class"].values
-    amounts = df["Amount"].values
-    n_features = X.shape[1]
-    T = len(df)
-    n_test = T - split_idx
+    partial = None
+    if "PartialInfoOnline" in r.index:
+        partial = r.loc["PartialInfoOnline", "cumulative_reward_mean"]
+        print(f"\n=== CLEAN COST OF PARTIAL FEEDBACK = Full-Info - Partial-Info "
+              f"(same model; only the feedback differs; no exploration) ===")
+        print(f"  ${ref - partial:,.2f}   (Partial-Info Online reward = ${partial:,.2f})")
 
-    print(f"Streaming {T} transactions ({split_idx} train / {n_test} test), "
-          f"{int(y.sum())} fraud total")
+    rows = r[r["family"] == FAMILY_BANDIT]
+    if not rows.empty and partial is not None and ref != partial:
+        print("\n=== Share of that loss each bandit RECOVERS through exploration ===")
+        print("    (bandit - Partial-Info) / (Full-Info - Partial-Info); "
+              "1.0 = as good as full information")
+        for name, row in rows.sort_values("cumulative_reward_mean", ascending=False).iterrows():
+            share = (row["cumulative_reward_mean"] - partial) / (ref - partial)
+            print(f"  {name:22s} {share:>7.2f}")
 
-    bandits = _make_bandit_policies(n_features)
-    full_info = FullInformationOnlineLearner(n_features)
-
-    all_names = list(bandits.keys()) + ["FullInfoOnline", "Oracle"]
-    logs = {name: {"reward": np.zeros(n_test), "regret": np.zeros(n_test),
-                   "action": np.zeros(n_test, dtype=int)} for name in all_names}
-
-    for t in range(T):
-        x_t, label_t, amt_t = X[t], y[t], amounts[t]
-        opt_r = oracle_cost_sensitive_reward(label_t, amt_t, C_a=C_A)
-        in_test = t >= split_idx
-        i = t - split_idx if in_test else None
-
-        # --- Bandits: PARTIAL feedback only (see reward for chosen action) ---
-        for name, policy in bandits.items():
-            a = policy.select_action(x_t)
-            r = cost_sensitive_reward(a, label_t, amt_t, C_a=C_A)
-            policy.update(x_t, a, r)
-            if in_test:
-                logs[name]["reward"][i] = r
-                logs[name]["regret"][i] = opt_r - r
-                logs[name]["action"][i] = a
-
-        # --- Full-information online: sees the TRUE LABEL every round ---
-        a_fi = full_info.select_action(x_t, amt_t, C_a=C_A)
-        r_fi = cost_sensitive_reward(a_fi, label_t, amt_t, C_a=C_A)
-        full_info.update(x_t, label_t)  # <-- true label, NOT r_fi
-        if in_test:
-            logs["FullInfoOnline"]["reward"][i] = r_fi
-            logs["FullInfoOnline"]["regret"][i] = opt_r - r_fi
-            logs["FullInfoOnline"]["action"][i] = a_fi
-
-        # --- Oracle (upper bound, for reference / regret calculation) ---
-        if in_test:
-            logs["Oracle"]["reward"][i] = opt_r
-            logs["Oracle"]["regret"][i] = 0.0
-            logs["Oracle"]["action"][i] = oracle_action(label_t)
-
-        if (t + 1) % 50000 == 0:
-            print(f"  ...processed {t + 1}/{T}")
-
-    return logs, test_df["Class"].values, test_df["Amount"].values
-
-
-def run_batch_supervised():
-    """Trains each batch SL model once, evaluates on the test region
-    using the PRIMARY (dynamic) threshold -- for a fair comparison
-    against the online policies above."""
-    results = {}
-    model_fns = [
-        ("LogisticRegression", lr_train_and_predict, lr_evaluate),
-        ("RandomForest", rf_train_and_predict, rf_evaluate),
-    ]
-    if _HAS_XGBOOST:
-        model_fns.append(("XGBoost", xgb_train_and_predict, xgb_evaluate))
-    else:
-        print("xgboost not installed in this environment -- skipping XGBoost.")
-
-    for model_name, train_fn, eval_fn in model_fns:
-        y_test, amounts_test, p_fraud = train_fn()
-        metrics = eval_fn(y_test, amounts_test, p_fraud, C_a=C_A, mode=THRESHOLD_MODE_PRIMARY)
-        results[model_name] = metrics
-        print(f"  {model_name} trained + evaluated")
-
-    return results
+    for family, label, explain in (
+        (FAMILY_BANDIT, "BANDIT GAP TO FULL INFORMATION",
+         "partial feedback + exploration + different model form"),
+        (FAMILY_FROZEN, "COST OF BEING FROZEN",
+         "both learn from true labels; only continued learning differs"),
+    ):
+        rows = r[r["family"] == family]
+        if rows.empty:
+            continue
+        print(f"\n=== {label} = Full-Info Online - policy  ({explain}) ===")
+        print("    positive = the handicap costs money; negative = policy beat the reference")
+        for name, row in rows.sort_values("cumulative_reward_mean", ascending=False).iterrows():
+            gap = ref - row["cumulative_reward_mean"]
+            std = row["cumulative_reward_std"]
+            spread = "" if pd.isna(std) else f"   (policy reward std across seeds: ${std:,.2f})"
+            print(f"  {name:22s} ${gap:>12,.2f}{spread}")
 
 
 def main():
-    print("=== Gap 4c: Cost of Partial Feedback ===\n")
+    parser = argparse.ArgumentParser(description="Experiment 2: cost of partial feedback.")
+    parser.add_argument("--C_a", type=float, default=C_A,
+                        help="investigation cost for this experiment (default: config C_A)")
+    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
+    parser.add_argument("--policies", nargs="+", default=None,
+                        help="run only policies whose names contain one of these "
+                             "(Oracle and FullInfoOnline are matched by name too)")
+    parser.add_argument("--no-cache", action="store_true")
+    args = parser.parse_args()
 
-    print("--- Streaming Oracle / FullInfoOnline / 5x CS_ bandits ---")
-    logs, y_test, amounts_test = run_online_stream()
+    config.ensure_directories()
+    data = prepare_data()
+    print("=== Experiment 2: cost of partial feedback ===")
+    print(data.summary())
+    print(f"C_a = ${args.C_a:g} | seeds = {args.seeds}\n")
 
-    print("\n--- Batch Supervised Learning (frozen after training) ---")
-    sl_results = run_batch_supervised()
+    plan = [(oracle_spec(), FAMILY_ORACLE),
+            (full_info_online_spec(data.n_features + 1), FAMILY_FULL_INFO),
+            (partial_info_online_spec(data, args.C_a), FAMILY_PARTIAL_INFO)]
+    plan += [(s, FAMILY_BANDIT) for s in bandit_specs(data.n_features + 1)
+             if s.group == CS_GROUP]
+    plan += [(s, FAMILY_FROZEN) for s in supervised_specs()]
+    plan = [(s, f) for s, f in plan if _selected(s.name, args.policies)]
+    if not plan:
+        print("No policies matched --policies; nothing to do.")
+        return
 
-    # ------------------------------------------------------------------
-    # Summarize every policy family on the SAME test region
-    # ------------------------------------------------------------------
-    n_fraud = int((y_test == 1).sum())
-    n_legit = int((y_test == 0).sum())
-    summary_rows = []
+    rows, t_start = [], time.time()
+    for spec, family in plan:
+        print(f"[{family}] {spec.name}")
+        runs = run_policy_all_seeds(spec, data, seeds=args.seeds, C_a=args.C_a,
+                                    threshold_mode=THRESHOLD_MODE_PRIMARY,
+                                    use_cache=not args.no_cache, verbose=True)
+        rows += [run_to_row(run, spec, family) for run in runs]
 
-    for name, log in logs.items():
-        blocked = log["action"] == 1
-        catch_rate = (blocked & (y_test == 1)).sum() / n_fraud if n_fraud else np.nan
-        false_block = (blocked & (y_test == 0)).sum() / n_legit if n_legit else np.nan
-        family = {"Oracle": "Oracle", "FullInfoOnline": "Full-Info Online"}.get(
-            name, "Bandit (partial feedback)")
-        summary_rows.append({
-            "policy": name, "family": family,
-            "cumulative_reward": log["reward"].sum(),
-            "cumulative_regret": log["regret"].sum(),
-            "fraud_catch_rate": catch_rate,
-            "false_block_rate": false_block,
-        })
+    results = pd.DataFrame(rows)[RESULT_COLUMNS]
+    summary = summarize_runs(results, ID_COLUMNS, VALUE_COLUMNS)
+    results.to_csv(RESULTS_CSV, index=False)
+    summary.to_csv(SUMMARY_CSV, index=False)
 
-    for name, metrics in sl_results.items():
-        summary_rows.append({
-            "policy": name, "family": "Batch SL (frozen)",
-            "cumulative_reward": metrics["cumulative_reward"],
-            "cumulative_regret": metrics["cumulative_regret"],
-            "fraud_catch_rate": metrics["fraud_catch_rate"],
-            "false_block_rate": metrics["false_block_rate"],
-        })
-
-    summary_df = pd.DataFrame(summary_rows).sort_values("cumulative_reward", ascending=False)
-    print("\n=== Summary (test region only) ===")
-    print(summary_df.to_string(index=False))
-
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    GRAPHS_DIR.mkdir(parents=True, exist_ok=True)
-    summary_df.to_csv(RESULTS_DIR / "partial_feedback_cost_results.csv", index=False)
-
-    # ------------------------------------------------------------------
-    # The two headline numbers this experiment exists to produce
-    # ------------------------------------------------------------------
-    full_info_reward = logs["FullInfoOnline"]["reward"].sum()
-    print(f"\n=== Cost decomposition ===")
-    print(f"FullInfoOnline cumulative reward (test region): ${full_info_reward:,.2f}\n")
-
-    print("Cost of PARTIAL FEEDBACK (FullInfoOnline - bandit; both online):")
-    for name in ["CS_EpsilonGreedy", "CS_LinUCB", "CS_LinTS", "CS_BootstrappedUCB", "CS_BootstrappedTS"]:
-        cost = full_info_reward - logs[name]["reward"].sum()
-        print(f"  {name:22s}: ${cost:,.2f}")
-
-    print("\nCost of BEING FROZEN (FullInfoOnline - batch SL; both see true labels eventually):")
-    for name, metrics in sl_results.items():
-        cost = full_info_reward - metrics["cumulative_reward"]
-        print(f"  {name:22s}: ${cost:,.2f}")
-
-    # ------------------------------------------------------------------
-    # Plot: cumulative reward over time (test region), all policies.
-    # Batch SL models are frozen (no per-round curve) -- shown as
-    # horizontal reference lines at their final total instead.
-    # ------------------------------------------------------------------
-    fig, ax = plt.subplots(figsize=(11, 6.5))
-    for name, log in logs.items():
-        style = "--" if name == "Oracle" else "-"
-        lw = 1.0 if name == "Oracle" else 1.5
-        ax.plot(np.cumsum(log["reward"]), style, label=name, linewidth=lw)
-    for name, metrics in sl_results.items():
-        ax.axhline(metrics["cumulative_reward"], linestyle=":", alpha=0.6,
-                   label=f"{name} (frozen, final total)")
-    ax.set_xlabel("Transaction (test region only)")
-    ax.set_ylabel("Cumulative Reward ($)")
-    ax.set_title("Gap 4c: Oracle vs. Full-Info-Online vs. Bandits vs. Frozen Batch SL")
-    ax.legend(fontsize=7, ncol=2, loc="lower left")
-    ax.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(GRAPHS_DIR / "partial_feedback_cost.png", dpi=150)
-
-    print(f"\nSaved: {RESULTS_DIR / 'partial_feedback_cost_results.csv'}")
-    print(f"Saved: {GRAPHS_DIR / 'partial_feedback_cost.png'}")
+    report(summary, args.C_a)
+    print(f"\nSaved {RESULTS_CSV}")
+    print(f"Saved {SUMMARY_CSV}")
+    print(f"Total time: {(time.time() - t_start) / 60:.1f} min")
 
 
 if __name__ == "__main__":
