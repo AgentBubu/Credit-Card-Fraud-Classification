@@ -14,10 +14,22 @@ Combined figures -> Graphs/combined/
     A  All policies -- classification metrics (precision, recall, F1, AUPRC)
     B  All policies -- decision quality (cumulative reward, cumulative regret)
     C  Experiment 1 -- sensitivity to the investigation cost C_a
-    D  Experiment 2 -- the cost of partial feedback
+    D  Experiment 2 -- the cost of partial feedback, as TWO standalone figures:
+         D_partial_feedback_left.png   cumulative reward of every policy
+         D_partial_feedback_right.png  extra cost compared with Full-Info Online
+
+Data exports -> Graphs/combined/ (the exact numbers behind two panels; each is
+built by the same function the plot uses, so CSV and figure always agree)
+    C_sensitivity_analysis_right.csv  Experiment 1, right panel: for each
+        algorithm and each investigation cost C_a,
+        difference = cost-sensitive cumulative reward - 0/1 cumulative reward
+        (mean over seeds). The x-axis of that panel is C_a, not time.
+    D_partial_feedback_cost_right.csv Experiment 2, right panel: for each policy,
+        extra cost = Full-Info Online cumulative reward - policy cumulative reward
+        (mean and std over seeds; positive = extra loss vs Full-Info Online)
 
 Separate figures (with --separate) -> Graphs/separate/
-    01-10 the pairwise comparisons, 11-12 the two experiments (same as C, D)
+    01-10 the pairwise comparisons, 11 = C, 12 = D (also split left / right)
 
 Reading the figures
 -------------------
@@ -350,7 +362,7 @@ def fig_decision(inputs, curves, policies, title, regret_by_family=True):
                 ax.set_ylabel("")
     else:
         regret_panel(fig.add_subplot(grid[1, 0]), curves, policies,
-                     "Cumulative regret over time (mean over seeds)")
+                     "Cumulative regret over time")
     return fig
 
 
@@ -368,7 +380,7 @@ def fig_decision_paired(inputs, curves, title):
     reward_reference_lines(top, inputs)
     top.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
     top.yaxis.set_major_formatter(MONEY)
-    top.set_title("Cumulative reward at the end of the test period (mean ± std over seeds)", pad=16)
+    top.set_title("Cumulative Reward", pad=16)
     for i, a in enumerate(ALGORITHMS):
         ax = fig.add_subplot(grid[1, i])
         regret_panel(ax, curves, [f"CS_{a}", f"LM_{a}"], ALGO_LABEL[a], show_legend=False)
@@ -381,6 +393,29 @@ def fig_decision_paired(inputs, curves, title):
         if i != 2:
             ax.set_xlabel("")
     return fig
+
+
+def sensitivity_gap_table(inputs):
+    """The exact series plotted in Experiment 1's right panel.
+    One row per algorithm per C_a:
+        difference = cost-sensitive cumulative reward - 0/1 cumulative reward
+    using each policy's mean over seeds. Also used for the CSV export."""
+    means = inputs.sens.pivot(index="policy", columns="C_a", values="cumulative_reward_mean")
+    rows = []
+    for a in ALGORITHMS:
+        cs, lm = f"CS_{a}", f"LM_{a}"
+        if cs in means.index and lm in means.index:
+            for c in means.columns:
+                rows.append({
+                    "C_a": float(c),
+                    "algorithm": a,
+                    "cost_sensitive_policy": cs,
+                    "label_matching_policy": lm,
+                    "cost_sensitive_cumulative_reward_mean": float(means.loc[cs, c]),
+                    "label_matching_cumulative_reward_mean": float(means.loc[lm, c]),
+                    "difference": float(means.loc[cs, c] - means.loc[lm, c]),
+                })
+    return pd.DataFrame(rows)
 
 
 def fig_sensitivity(inputs):
@@ -418,10 +453,11 @@ def fig_sensitivity(inputs):
     a1.text(C_A, len(ranks) + 0.6, f"default ${C_A:g}", fontsize=8, color=GREY,
             ha="center", va="top")
 
+    gaps = sensitivity_gap_table(inputs)                  # same numbers as the CSV
     for j, a in enumerate(ALGORITHMS):
-        if f"CS_{a}" in means.index and f"LM_{a}" in means.index:
-            gap = means.loc[f"CS_{a}"] - means.loc[f"LM_{a}"]
-            a2.plot(gap.index, gap.values, color=BLACK, lw=1.6, marker="osD^v"[j], ms=6,
+        g = gaps[gaps["algorithm"] == a].sort_values("C_a")
+        if len(g):
+            a2.plot(g["C_a"], g["difference"], color=BLACK, lw=1.6, marker="osD^v"[j], ms=6,
                     ls=["-", "--", "-.", ":", (0, (5, 1, 1, 1))][j], label=ALGO_LABEL[a])
     a2.axhline(0, color=GREY, lw=1)
     cost_axis(a2)
@@ -433,43 +469,104 @@ def fig_sensitivity(inputs):
     return fig
 
 
-def fig_partial_feedback(inputs):
-    """Experiment 2: (a) cumulative reward of every policy, (b) extra cost
-    compared with Full-Info Online -- the partial-feedback and frozen costs, in dollars."""
+def _pf_groups(inputs):
+    """Policy groups for Experiment 2, each ordered best first."""
     df = inputs.pf
     by_family = lambda fam: (df[df["family"] == fam].groupby("policy", sort=False)
-                             ["cumulative_reward"].mean().sort_values(ascending=False).index.tolist())
-    groups_a = [("Reference", ["Oracle", "FullInfoOnline", "PartialInfoOnline"]),
-                ("Bandits (partial feedback)", by_family("Bandit (partial feedback)")),
-                ("Supervised (frozen)", by_family("Supervised (frozen)"))]
-    vals = lambda p: df.loc[df["policy"] == p, "cumulative_reward"].to_numpy(float)
+                             ["cumulative_reward"].mean().sort_values(ascending=False)
+                             .index.tolist())
+    return {"Reference": [p for p in ("Oracle", "FullInfoOnline", "PartialInfoOnline")
+                          if (df["policy"] == p).any()],
+            "Bandits": by_family("Bandit (partial feedback)"),
+            "Supervised": by_family("Supervised (frozen)")}
 
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(17, 7), constrained_layout=True,
-                                 gridspec_kw={"width_ratios": [1.2, 1]})
-    fig.suptitle("Experiment 2 — The cost of partial feedback", fontsize=13, fontweight="bold")
-    grouped_bars(a1, groups_a, vals, reward_ylim(inputs), fmt=money)
-    reward_reference_lines(a1, inputs)
-    a1.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
-    a1.yaxis.set_major_formatter(MONEY)
-    a1.set_title(f"Every policy at C_a = ${C_A:g}", pad=16)
 
-    full = df.loc[df["policy"] == "FullInfoOnline", "cumulative_reward"]
-    if len(full):
-        full = float(full.mean())
-        extra = lambda p: full - vals(p)
-        groups_b = [("No exploration", ["PartialInfoOnline"]),
-                    ("Bandits (explore)", groups_a[1][1]),
-                    ("Supervised (frozen)", groups_a[2][1])]
-        cap = 1.3 * float(extra("PartialInfoOnline").mean()) if len(vals("PartialInfoOnline")) \
-            else 5000.0
-        grouped_bars(a2, groups_b, extra, (min(-0.1 * cap, -200), cap), fmt=money)
-        a2.axhline(0, color=GREY, lw=1)
-        a2.set_ylabel("Extra cost compared with Full-Info Online ($)\n"
-                      "(lower is better; below $0 = beat Full-Info)")
-        a2.yaxis.set_major_formatter(MONEY)
-        a2.set_title("What each limitation costs, in dollars\n"
-                     "(Partial-Info = partial feedback with no exploration)", pad=16)
+def _pf_rewards(inputs, policy):
+    """Per-seed cumulative rewards of one policy in Experiment 2."""
+    df = inputs.pf
+    return df.loc[df["policy"] == policy, "cumulative_reward"].to_numpy(float)
+
+
+def _pf_full_info(inputs):
+    full = _pf_rewards(inputs, "FullInfoOnline")
+    return float(full.mean()) if len(full) else None
+
+
+def _pf_extra_cost(inputs, policy):
+    """Per-seed extra cost vs Full-Info Online:
+        Full-Info Online cumulative reward - policy cumulative reward
+    Positive = the policy lost more money than Full-Info Online."""
+    return _pf_full_info(inputs) - _pf_rewards(inputs, policy)
+
+
+def _pf_right_groups(inputs):
+    g = _pf_groups(inputs)
+    return [("No exploration", [p for p in ["PartialInfoOnline"] if p in g["Reference"]]),
+            ("Bandits (explore)", g["Bandits"]),
+            ("Supervised (frozen)", g["Supervised"])]
+
+
+def partial_feedback_extra_table(inputs):
+    """The exact series plotted in Experiment 2's right panel, one row per policy
+    (bar = mean over seeds, error bar = std). Also used for the CSV export."""
+    full = _pf_full_info(inputs)
+    rows = []
+    for group, pols in _pf_right_groups(inputs):
+        for p in pols:
+            extra = _pf_extra_cost(inputs, p)
+            rows.append({
+                "policy": p,
+                "group": group,
+                "n_seeds": len(extra),
+                "full_info_cumulative_reward": full,
+                "policy_cumulative_reward_mean": float(_pf_rewards(inputs, p).mean()),
+                "extra_cost_mean": float(extra.mean()),
+                "extra_cost_std": float(np.std(extra, ddof=1)) if len(extra) > 1 else np.nan,
+            })
+    return pd.DataFrame(rows)
+
+
+def fig_partial_feedback_left(inputs):
+    """Experiment 2, standalone figure 1: cumulative reward of every policy."""
+    g = _pf_groups(inputs)
+    groups = [("Reference", g["Reference"]), ("Bandits (partial feedback)", g["Bandits"]),
+              ("Supervised (frozen)", g["Supervised"])]
+    fig, ax = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
+    fig.suptitle("Experiment 2 — Cumulative reward of every policy", fontsize=13,
+                 fontweight="bold")
+    grouped_bars(ax, groups, lambda p: _pf_rewards(inputs, p), reward_ylim(inputs), fmt=money)
+    reward_reference_lines(ax, inputs)
+    ax.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
+    ax.yaxis.set_major_formatter(MONEY)
+    ax.set_title(f"All policies at C_a = ${C_A:g}", pad=16)
     return fig
+
+
+def fig_partial_feedback_right(inputs):
+    """Experiment 2, standalone figure 2: extra cost compared with Full-Info Online."""
+    fig, ax = plt.subplots(figsize=(10, 6.5), constrained_layout=True)
+    fig.suptitle("Experiment 2 — Extra cost compared with Full-Info Online",
+                 fontsize=13, fontweight="bold")
+    if _pf_full_info(inputs) is None:
+        ax.text(0.5, 0.5, "Full-Info Online not in the results", ha="center",
+                transform=ax.transAxes)
+        return fig
+    extra = lambda p: _pf_extra_cost(inputs, p)          # same numbers as the CSV
+    partial = _pf_rewards(inputs, "PartialInfoOnline")
+    cap = 1.3 * float(extra("PartialInfoOnline").mean()) if len(partial) else 5000.0
+    grouped_bars(ax, _pf_right_groups(inputs), extra, (min(-0.1 * cap, -200), cap), fmt=money)
+    ax.axhline(0, color=GREY, lw=1)
+    ax.set_ylabel("Full-Info Online cumulative reward − policy cumulative reward ($)\n"
+                  "(extra loss; lower is better; below $0 = beat Full-Info Online)")
+    ax.yaxis.set_major_formatter(MONEY)
+    ax.set_title("What each policy costs, in dollars", pad=16)
+    return fig
+
+
+def export_csv(df, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False)
+    print(f"  saved {path.relative_to(GRAPHS_DIR.parent)}")
 
 
 # =====================================================================
@@ -492,18 +589,22 @@ def main():
     print("Combined figures:")
     if inputs.main is not None:
         everyone = inputs.present(ALL_POLICIES)
-        save(fig_classification(inputs, everyone, "All policies — Standard Metrics"),
+        save(fig_classification(inputs, everyone, "All policies — Standard metrics"),
              C / "A_all_standard.png")
-        save(fig_decision(inputs, curves, everyone, "All policies — Decision Quality"),
+        save(fig_decision(inputs, curves, everyone, "All policies — Decision quality"),
              C / "B_all_decision_quality.png")
     if inputs.sens is not None:
         fig = fig_sensitivity(inputs)
         save(fig, C / "C_sensitivity_analysis.png",
              *([S / "11_sensitivity_analysis.png"] if args.separate else []))
+        export_csv(sensitivity_gap_table(inputs), C / "C_sensitivity_analysis_right.csv")
     if inputs.pf is not None:
-        fig = fig_partial_feedback(inputs)
-        save(fig, C / "D_partial_feedback_cost.png",
-             *([S / "12_partial_feedback_cost.png"] if args.separate else []))
+        save(fig_partial_feedback_left(inputs), C / "D_partial_feedback_left.png",
+             *([S / "12_partial_feedback_left.png"] if args.separate else []))
+        save(fig_partial_feedback_right(inputs), C / "D_partial_feedback_right.png",
+             *([S / "12_partial_feedback_right.png"] if args.separate else []))
+        if _pf_full_info(inputs) is not None:
+            export_csv(partial_feedback_extra_table(inputs), C / "D_partial_feedback_cost_right.csv")
 
     if args.separate and inputs.main is not None:
         print("Separate figures:")
