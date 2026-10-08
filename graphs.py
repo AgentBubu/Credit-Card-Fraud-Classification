@@ -1,12 +1,12 @@
 """
-make_graphs.py  --  Step 4: the thesis figures (PNG, saved in Graphs/).
+graphs.py  --  Step 4: the thesis figures (PNG, saved in Graphs/).
 
 Run after main.py and the three experiment scripts. Nothing is re-run:
 every figure is drawn from Results/ (the CSV files, and the saved decisions
 for the regret curves), so the figures always show exactly those numbers.
 
-    python make_graphs.py              figures at the default C_a ($10)
-    python make_graphs.py --C_a 50     figures 1-4 and 6a at another C_a
+    python graphs.py              figures at the default C_a ($10)
+    python graphs.py --C_a 50     figures 1-4 and 6a at another C_a
 
 Figures
 -------
@@ -16,10 +16,12 @@ Figures
   fig3_regret_all_models     cumulative regret of every model in one panel
   fig4_cost_breakdown        total cost split into fraud loss and investigation cost
   fig5a_ranking              Experiment 1: ranking of the models at each C_a
-  fig5b_reward_gap           Experiment 1: cost-sensitive vs 0/1 reward, per
-                             algorithm (bootstrap 95% intervals)
+  fig5b_reward_gap           Experiment 1: bandits, cost-sensitive vs 0/1 reward,
+                             per algorithm (bootstrap 95% intervals)
   fig5c_bandit_vs_supervised Experiment 1: best bandit vs best supervised model
                              (bootstrap 95% intervals)
+  fig5d_csl_vs_csd           Experiment 1: supervised, cost-sensitive learning vs
+                             cost-sensitive decision, per model (bootstrap 95% intervals)
   fig6a_extra_cost           Experiment 2: each model's cost minus Full-Info Online's
   fig6b_partial_vs_full      Experiment 2: Full-Info vs Partial-Info Online at each
                              C_a; the gap in each pair = the cost of partial feedback
@@ -31,14 +33,20 @@ suffix such as _Ca50 to the file name). The others cover every C_a.
 
 Reading the figures
 -------------------
-  - Every model has its OWN colour, the same in every figure:
-        ε-greedy yellow, LinUCB aqua, LinTS violet (both reward versions),
+  - Every algorithm has its OWN colour, the same in every figure and in
+    both of its versions:
+        ε-greedy yellow, LinUCB aqua, LinTS violet,
         Logistic Regression red, Random Forest green, XGBoost blue,
         Full-/Partial-Info Online grey.
-  - Line style marks the family: solid = bandit with cost-sensitive reward,
-    dashed = bandit with 0/1 reward, dash-dot = supervised;
-    Full-Info Online solid grey, Partial-Info Online dashed grey.
-    In bar charts, 0/1 bandits and Partial-Info Online are hatched.
+  - Line style marks the version:
+        solid        = bandit, cost-sensitive reward (CB_CS)
+        dashed       = bandit, 0/1 reward (CB_LM)
+        dash-dot     = supervised, cost-sensitive decision (SL_CSD)
+        dash-dot-dot = supervised, cost-sensitive learning (SL_CSL)
+        Full-Info Online solid grey, Partial-Info Online dashed grey.
+  - In bar charts, versions whose LEARNING does not use the costs are
+    hatched: 0/1 bandits and CSD supervised models (and Partial-Info
+    Online, to tell it apart from its twin).
   - Bars show the mean over seeds, error bars the standard deviation, dots
     the individual seeds (deterministic models run once: no error bar).
   - Values beyond an axis are drawn at the edge with their true value
@@ -60,7 +68,9 @@ import pandas as pd
 from matplotlib.lines import Line2D
 
 from Common import config
-from Common.config import BANDIT_GRIDS, C_A, GRAPHS_DIR, RESULTS_DIR, TUNING_CSV
+from Common.config import (
+    BANDIT_GRIDS, C_A, GRAPHS_DIR, RESULTS_DIR, SUPERVISED_MODELS, TUNING_CSV,
+)
 
 # =====================================================================
 # Models, colours, styles
@@ -79,16 +89,20 @@ SHORT = {"EpsilonGreedy": "ε-greedy", "LinUCB": "LinUCB", "LinTS": "LinTS",
          "LogisticRegression": "Logistic Reg.", "RandomForest": "Random Forest",
          "XGBoost": "XGBoost", "FullInfoOnline": "Full-Info Online",
          "PartialInfoOnline": "Partial-Info Online", "Oracle": "Oracle"}
-FAMILY_STYLE = {"cs": "-", "lm": (0, (5, 2.5)), "sl": (0, (6, 2, 1.5, 2)),
+FAMILY_STYLE = {"cs": "-", "lm": (0, (5, 2.5)), "csd": (0, (6, 2, 1.5, 2)),
+                "csl": (0, (6, 1.6, 1.4, 1.6, 1.4, 1.6)),
                 "full": "-", "partial": (0, (5, 2.5)), "oracle": "-"}
+HATCHED = ("lm", "csd", "partial")         # learning does not use the costs
 
 GROUPS = [   # (title, family key, model ids)
-    ("Bandit, cost-sensitive", "cs", [f"CS_{a}" for a in BANDIT_GRIDS]),
-    ("Bandit, 0/1", "lm", [f"LM_{a}" for a in BANDIT_GRIDS]),
-    ("Supervised", "sl", ["LogisticRegression", "RandomForest", "XGBoost"]),
+    ("Bandit, cost-sensitive", "cs", [f"CB_CS_{a}" for a in BANDIT_GRIDS]),
+    ("Bandit, 0/1", "lm", [f"CB_LM_{a}" for a in BANDIT_GRIDS]),
+    ("Supervised, CSD", "csd", [f"SL_CSD_{m}" for m in SUPERVISED_MODELS]),
+    ("Supervised, CSL", "csl", [f"SL_CSL_{m}" for m in SUPERVISED_MODELS]),
     ("Reference", "ref", ["FullInfoOnline", "PartialInfoOnline"]),
 ]
-MAIN_MODELS = [m for _, _, ms in GROUPS[:3] for m in ms]
+MAIN_MODELS = [m for _, _, ms in GROUPS[:4] for m in ms]
+_PREFIX = {"CB_CS_": "cs", "CB_LM_": "lm", "SL_CSD_": "csd", "SL_CSL_": "csl"}
 
 plt.rcParams.update({
     "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
@@ -103,16 +117,17 @@ plt.rcParams.update({
 
 
 def base_name(model_id):
-    return model_id[3:] if model_id[:3] in ("CS_", "LM_") else model_id
+    for prefix in _PREFIX:
+        if model_id.startswith(prefix):
+            return model_id[len(prefix):]
+    return model_id
 
 
 def family_of(model_id):
-    if model_id.startswith("CS_"):
-        return "cs"
-    if model_id.startswith("LM_"):
-        return "lm"
-    return {"FullInfoOnline": "full", "PartialInfoOnline": "partial",
-            "Oracle": "oracle"}.get(model_id, "sl")
+    for prefix, fam in _PREFIX.items():
+        if model_id.startswith(prefix):
+            return fam
+    return {"FullInfoOnline": "full", "PartialInfoOnline": "partial"}.get(model_id, "oracle")
 
 
 def color_of(model_id):
@@ -124,16 +139,14 @@ def style_of(model_id):
 
 
 def label_of(model_id, long=True):
-    """'LinTS (cost-sensitive)', 'LinTS (0/1)', 'XGBoost', ..."""
+    """'LinTS (cost-sensitive)', 'LinTS (0/1)', 'XGBoost (CSD)', 'XGBoost (CSL)', ..."""
     name = SHORT[base_name(model_id)]
     fam = family_of(model_id)
-    if fam == "cs":
-        return f"{name} ({'cost-sensitive' if long else 'CS'})"
-    if fam == "lm":
-        return f"{name} (0/1)"
-    if fam == "sl" and long and name == "Logistic Reg.":
-        return "Logistic Regression"
-    return name
+    if long and name == "Logistic Reg.":
+        name = "Logistic Regression"
+    suffix_ = {"cs": "cost-sensitive" if long else "CS", "lm": "0/1",
+               "csd": "CSD", "csl": "CSL"}.get(fam)
+    return f"{name} ({suffix_})" if suffix_ else name
 
 
 def money(x, _=None):
@@ -268,7 +281,7 @@ def grouped_bars(ax, groups, values, ylim, fmt=lambda v: f"{v:.2f}"):
         shown = min(max(mean, lo), hi)
         ax.bar(x, shown - base, bottom=base, width=0.72, color=color_of(m),
                edgecolor=SURFACE, linewidth=0,
-               hatch="////" if family_of(m) in ("lm", "partial") else None)
+               hatch="////" if family_of(m) in HATCHED else None)
         if std is not None and not np.isnan(std):
             ax.errorbar(x, shown, yerr=std, fmt="none", ecolor=INK, elinewidth=0.9, capsize=2.5)
         if seed_vals is not None and len(seed_vals) > 1:
@@ -376,8 +389,8 @@ def regret_panel(ax, curves, models, title, ymax, legend=True, bands=True):
 
 def fig_decision_quality(inp):
     curves = inp.curves()
-    fig = plt.figure(figsize=(13, 8.8))
-    gs = fig.add_gridspec(2, 4, height_ratios=[1, 1.1], hspace=0.55, wspace=0.12)
+    fig = plt.figure(figsize=(14, 13))
+    gs = fig.add_gridspec(3, 3, height_ratios=[1, 1, 1], hspace=0.5, wspace=0.12, top=0.94)
 
     ax = fig.add_subplot(gs[0, :])
     vals = summary_values(inp, "total_cost")
@@ -399,13 +412,15 @@ def fig_decision_quality(inp):
     if curves:
         ymax = regret_ymax(curves)
         axes = []
-        for i, (title, _, models) in enumerate(GROUPS):
-            a = fig.add_subplot(gs[1, i], sharey=axes[0] if axes else None)
+        slots = [(1, 0), (1, 1), (2, 0), (2, 1), (1, 2)]    # bandits / supervised / reference
+        for (row, col), (title, _, models) in zip(slots, GROUPS):
+            a = fig.add_subplot(gs[row, col], sharey=axes[0] if axes else None)
             regret_panel(a, curves, models, f"Cumulative regret: {title}", ymax)
-            if i:
+            if col:
                 a.tick_params(labelleft=False)
+            else:
+                a.set_ylabel("Cumulative regret ($)\n(lower is better)")
             axes.append(a)
-        axes[0].set_ylabel("Cumulative regret ($)\n(lower is better)")
     else:
         print("  note: no decision files, so fig2 has no regret panels (run main.py)")
     fig.suptitle(f"All models — decision quality (C_a = ${inp.C_a:g})", fontweight="bold",
@@ -441,7 +456,8 @@ def fig_regret_all(inp):
     ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t) for k, t in
                        (("cs", "solid = bandit, cost-sensitive  (grey: Full-Info Online)"),
                         ("lm", "dashed = bandit, 0/1  (grey: Partial-Info Online)"),
-                        ("sl", "dash-dot = supervised"))],
+                        ("csd", "dash-dot = supervised, CSD"),
+                        ("csl", "dash-dot-dot = supervised, CSL"))],
               loc="upper left", fontsize=7.5)
     save(fig, f"fig3_regret_all_models{suffix(inp.C_a)}")
 
@@ -457,7 +473,7 @@ def fig_cost_breakdown(inp):
     fig, ax = plt.subplots(figsize=(8.5, 0.4 * len(s) + 1.5))
     right = 0.0
     for yi, (m, r) in enumerate(s.iterrows()):
-        c, hatch = color_of(m), ("////" if family_of(m) in ("lm", "partial") else None)
+        c, hatch = color_of(m), ("////" if family_of(m) in HATCHED else None)
         ax.barh(yi, r["fraud_loss_mean"], height=0.62, color=c, edgecolor=SURFACE,
                 hatch=hatch, linewidth=0)
         ax.barh(yi, r["investigation_cost_mean"], left=r["fraud_loss_mean"], height=0.62,
@@ -527,7 +543,7 @@ def fig_ranking(inp):
     cas = sorted(s["C_a"].unique())
     ranks = (s.pivot(index="model_id", columns="C_a", values="total_cost_mean")
              .rank(ascending=True, method="min"))
-    fig, ax = plt.subplots(figsize=(10.5, 6))
+    fig, ax = plt.subplots(figsize=(10.5, 7))
     for m in [m for m in MAIN_MODELS if m in ranks.index]:
         ax.plot(cas, ranks.loc[m, cas], color=color_of(m), linestyle=style_of(m), marker="o",
                 markeredgecolor=SURFACE, markeredgewidth=1)
@@ -544,9 +560,9 @@ def fig_ranking(inp):
             color=INK_3, va="bottom")
     ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t)
                        for k, t in (("cs", "bandit, cost-sensitive"), ("lm", "bandit, 0/1"),
-                                    ("sl", "supervised"))],
-              loc="upper left", bbox_to_anchor=(0, -0.12), ncol=3, fontsize=8)
-    ax.set_title(f"{EXP1_TITLE}\n(a) Ranking of the nine main models at each investigation cost",
+                                    ("csd", "supervised, CSD"), ("csl", "supervised, CSL"))],
+              loc="upper left", bbox_to_anchor=(0, -0.12), ncol=4, fontsize=8)
+    ax.set_title(f"{EXP1_TITLE}\n(a) Ranking of the twelve main models at each investigation cost",
                  loc="left", fontsize=10.5)
     save(fig, "fig5a_ranking")
 
@@ -559,11 +575,11 @@ def fig_reward_gap(inp):
         return
     rw = b[b["group"] == "reward"]
     cas = sorted(rw["C_a"].unique())
-    algos = [a for a in BANDIT_GRIDS if (rw["model_a"] == f"CS_{a}").any()]
+    algos = [a for a in BANDIT_GRIDS if (rw["model_a"] == f"CB_CS_{a}").any()]
     markers = {"EpsilonGreedy": "o", "LinUCB": "s", "LinTS": "^"}
     offs = dict(zip(algos, np.exp(np.linspace(-0.09, 0.09, len(algos)))))
     fig, ax = plt.subplots(figsize=(8.5, 5.2))
-    _gap_points(ax, [(MODEL_COLOR[a], markers[a], a, rw[rw["model_a"] == f"CS_{a}"])
+    _gap_points(ax, [(MODEL_COLOR[a], markers[a], a, rw[rw["model_a"] == f"CB_CS_{a}"])
                      for a in algos], flip=True, offsets=offs)
     _ca_axis(ax, cas)
     ax.set_xlim(cas[0] / 1.4, cas[-1] * 1.4)
@@ -572,7 +588,7 @@ def fig_reward_gap(inp):
     ax.legend(handles=[Line2D([], [], color=MODEL_COLOR[a], marker=markers[a],
                               linestyle="none", label=SHORT[a]) for a in algos] + SIG_HANDLES,
               loc="best", fontsize=7.5)
-    ax.set_title(f"{EXP1_TITLE}\n(b) Does the cost-sensitive reward win? "
+    ax.set_title(f"{EXP1_TITLE}\n(b) Bandits: does the cost-sensitive reward win? "
                  "Difference per algorithm with 95% bootstrap interval", loc="left",
                  fontsize=10.5)
     save(fig, "fig5b_reward_gap")
@@ -605,6 +621,34 @@ def fig_family_gap(inp):
     save(fig, "fig5c_bandit_vs_supervised")
 
 
+def fig_csl_vs_csd(inp):
+    """Figure 5d: cost-sensitive learning vs cost-sensitive decision, per
+    supervised model (bootstrap)."""
+    b = inp.bootstrap
+    if b is None or not (b["group"] == "sl_cost").any():
+        print("  skipped fig5d: no CSL vs CSD comparisons in bootstrap_results.csv")
+        return
+    sc = b[b["group"] == "sl_cost"]
+    cas = sorted(sc["C_a"].unique())
+    models = [m for m in SUPERVISED_MODELS if (sc["model_a"] == f"SL_CSL_{m}").any()]
+    markers = {"LogisticRegression": "o", "RandomForest": "s", "XGBoost": "^"}
+    offs = dict(zip(models, np.exp(np.linspace(-0.09, 0.09, len(models)))))
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    _gap_points(ax, [(MODEL_COLOR[m], markers[m], m, sc[sc["model_a"] == f"SL_CSL_{m}"])
+                     for m in models], flip=True, offsets=offs)
+    _ca_axis(ax, cas)
+    ax.set_xlim(cas[0] / 1.4, cas[-1] * 1.4)
+    ax.set_ylabel("CSD cost − CSL cost ($)\n"
+                  "(above $0 = cost-sensitive learning is cheaper)")
+    ax.legend(handles=[Line2D([], [], color=MODEL_COLOR[m], marker=markers[m],
+                              linestyle="none", label=label_of(f"SL_CSD_{m}").split(" (")[0])
+                       for m in models] + SIG_HANDLES, loc="best", fontsize=7.5)
+    ax.set_title(f"{EXP1_TITLE}\n(d) Supervised: does cost-sensitive learning beat the "
+                 "cost-sensitive decision rule?\nDifference per model with 95% bootstrap "
+                 "interval", loc="left", fontsize=10.5)
+    save(fig, "fig5d_csl_vs_csd")
+
+
 # =====================================================================
 # Figure 6: Experiment 2 (cost of partial feedback)
 # =====================================================================
@@ -617,13 +661,15 @@ def fig_extra_cost(inp):
     full = s.loc["FullInfoOnline", "total_cost_mean"]
     groups = [("Partial feedback,\nno exploration", "ref", ["PartialInfoOnline"]),
               ("Bandit, cost-sensitive\n(partial feedback + exploration)", "cs",
-               [f"CS_{a}" for a in BANDIT_GRIDS]),
-              ("Supervised\n(true labels, never updated)", "sl",
-               ["LogisticRegression", "RandomForest", "XGBoost"])]
+               [f"CB_CS_{a}" for a in BANDIT_GRIDS]),
+              ("Supervised, CSD\n(never updated)", "csd",
+               [f"SL_CSD_{m}" for m in SUPERVISED_MODELS]),
+              ("Supervised, CSL\n(never updated)", "csl",
+               [f"SL_CSL_{m}" for m in SUPERVISED_MODELS])]
     vals = {m: (s.loc[m, "total_cost_mean"] - full, s.loc[m, "total_cost_std"],
                 inp.seeds(m, "total_cost") - full)
             for _, _, ms in groups for m in ms if m in s.index}
-    fig, ax = plt.subplots(figsize=(9, 5.4))
+    fig, ax = plt.subplots(figsize=(11, 5.4))
     ext = [v[0] + (0 if np.isnan(v[1]) else v[1]) for v in vals.values()]
     low = [v[0] - (0 if np.isnan(v[1]) else v[1]) for v in vals.values()]
     lo, hi = min(0, min(low)) * 1.25 - 1, max(0, max(ext)) * 1.15 + 1
@@ -697,8 +743,9 @@ def fig_blocked(inp):
     shown_models = ["Oracle", "FullInfoOnline"] + MAIN_MODELS
     rest = s[s["model_id"].isin(shown_models) & (s["C_a"] > cas[0])]["blocked"]
     cap = float(rest.max()) * 1.15 if len(rest) else 200.0  # everything fits except the smallest C_a
-    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.8), sharey=True)
-    for ax, (title, _, models) in zip(axes, GROUPS[:3]):
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharey=True)
+    axes = axes.flatten()
+    for ax, (title, _, models) in zip(axes, GROUPS[:4]):
         for m in ["Oracle", "FullInfoOnline"] + models:
             g = s[s["model_id"] == m].set_index("C_a").reindex(cas)["blocked"]
             if g.isna().all():
@@ -716,7 +763,9 @@ def fig_blocked(inp):
         ax.set_ylim(0, cap * 1.05)
         ax.set_title(title, fontsize=9.5)
         ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=6.8)
-    axes[0].set_ylabel("Transactions blocked on the test period\n(caught frauds + false alarms)")
+    for i in (0, 2):
+        axes[i].set_ylabel("Transactions blocked on the test period\n"
+                           "(caught frauds + false alarms)")
     fig.suptitle("How many transactions each model blocks as investigation gets more expensive\n"
                  "(▲ = above the axis; the true value is in the legend)", fontweight="bold",
                  fontsize=10.5)
@@ -805,6 +854,7 @@ def main():
     fig_ranking(inp)
     fig_reward_gap(inp)
     fig_family_gap(inp)
+    fig_csl_vs_csd(inp)
     fig_extra_cost(inp)
     fig_partial_vs_full(inp)
     fig_blocked(inp)

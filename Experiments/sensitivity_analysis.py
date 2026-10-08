@@ -10,10 +10,12 @@ every model at C_a = $1, $5, $10, $20 and $50, each with the setting tuned
 for THAT C_a. This script checks whether the answers to the research
 questions change with C_a:
 
-  1. the ranking of the nine main models (6 bandits, 3 supervised)
+  1. the ranking of the twelve main models (6 bandits, 6 supervised)
   2. which family wins: the best bandit vs the best supervised model
-  3. cost-sensitive vs 0/1 reward, algorithm by algorithm
-  4. whether the tuned settings themselves change with C_a
+  3. bandits: cost-sensitive vs 0/1 reward, algorithm by algorithm
+  4. supervised: cost-sensitive learning (CSL) vs cost-sensitive decision
+     (CSD), model by model
+  5. whether the tuned settings themselves change with C_a
 
 How to read it
 --------------
@@ -31,6 +33,7 @@ Outputs
   Results/sensitivity_ranks.csv        model x C_a: mean total cost, std, rank
   Results/sensitivity_family_gap.csv   per C_a: best bandit vs best supervised
   Results/sensitivity_reward_gap.csv   per algorithm x C_a: cost-sensitive vs 0/1
+  Results/sensitivity_sl_gap.csv       per supervised model x C_a: CSL vs CSD
   Results/sensitivity_settings.csv     per model: the tuned setting at each C_a
 
 Usage
@@ -42,13 +45,16 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
-from Common.config import BANDIT_GRIDS, C_A, C_A_SWEEP_VALUES, RESULTS_DIR, SELECTED_SETTINGS_CSV
+from Common.config import (
+    BANDIT_GRIDS, C_A, C_A_SWEEP_VALUES, RESULTS_DIR, SELECTED_SETTINGS_CSV, SUPERVISED_MODELS,
+)
 from Common.registry import FAMILY_BANDIT, FAMILY_SUPERVISED
 from main import load_results, summary_table
 
 RANKS_CSV = RESULTS_DIR / "sensitivity_ranks.csv"
 FAMILY_GAP_CSV = RESULTS_DIR / "sensitivity_family_gap.csv"
 REWARD_GAP_CSV = RESULTS_DIR / "sensitivity_reward_gap.csv"
+SL_GAP_CSV = RESULTS_DIR / "sensitivity_sl_gap.csv"
 SETTINGS_CSV = RESULTS_DIR / "sensitivity_settings.csv"
 
 MAIN_FAMILIES = (FAMILY_BANDIT, FAMILY_SUPERVISED)
@@ -115,8 +121,8 @@ def reward_gap(summary):
     (negative = the cost-sensitive reward is cheaper)."""
     rows = []
     for algo in BANDIT_GRIDS:
-        cs = summary[summary["model_id"] == f"CS_{algo}"].set_index("C_a")
-        lm = summary[summary["model_id"] == f"LM_{algo}"].set_index("C_a")
+        cs = summary[summary["model_id"] == f"CB_CS_{algo}"].set_index("C_a")
+        lm = summary[summary["model_id"] == f"CB_LM_{algo}"].set_index("C_a")
         for C_a in sorted(set(cs.index) & set(lm.index)):
             gap = cs.loc[C_a, "total_cost_mean"] - lm.loc[C_a, "total_cost_mean"]
             rows.append({"algorithm": algo, "C_a": C_a,
@@ -126,6 +132,25 @@ def reward_gap(summary):
                          "zero_one_std": lm.loc[C_a, "total_cost_std"],
                          "gap_cs_minus_01": gap,
                          "cheaper_reward": "cost_sensitive" if gap < 0 else "0/1"})
+    return pd.DataFrame(rows)
+
+
+def sl_gap(summary):
+    """Per supervised model x C_a: CSL minus CSD mean total cost
+    (negative = cost-sensitive learning is cheaper)."""
+    rows = []
+    for model in SUPERVISED_MODELS:
+        csl = summary[summary["model_id"] == f"SL_CSL_{model}"].set_index("C_a")
+        csd = summary[summary["model_id"] == f"SL_CSD_{model}"].set_index("C_a")
+        for C_a in sorted(set(csl.index) & set(csd.index)):
+            gap = csl.loc[C_a, "total_cost_mean"] - csd.loc[C_a, "total_cost_mean"]
+            rows.append({"model": model, "C_a": C_a,
+                         "csl_cost": csl.loc[C_a, "total_cost_mean"],
+                         "csl_std": csl.loc[C_a, "total_cost_std"],
+                         "csd_cost": csd.loc[C_a, "total_cost_mean"],
+                         "csd_std": csd.loc[C_a, "total_cost_std"],
+                         "gap_csl_minus_csd": gap,
+                         "cheaper_version": "CSL" if gap < 0 else "CSD"})
     return pd.DataFrame(rows)
 
 
@@ -149,7 +174,7 @@ def _money(x):
     return f"${x:,.2f}"
 
 
-def report(ranks, agreement, fam, rew, settings, missing):
+def report(ranks, agreement, fam, rew, slg, settings, missing):
     if missing:
         print(f"NOTE: not in results.csv yet, left out: {missing}\n")
 
@@ -166,40 +191,48 @@ def report(ranks, agreement, fam, rew, settings, missing):
     if len(fam):
         print("\n=== 2. Best bandit vs best supervised model ===")
         for r in fam.itertuples():
-            print(f"  C_a = ${r.C_a:>4g}: {r.best_bandit:<18} {_money(r.best_bandit_cost):>12}"
-                  f"  vs  {r.best_supervised:<18} {_money(r.best_supervised_cost):>12}"
+            print(f"  C_a = ${r.C_a:>4g}: {r.best_bandit:<22} {_money(r.best_bandit_cost):>12}"
+                  f"  vs  {r.best_supervised:<26} {_money(r.best_supervised_cost):>12}"
                   f"   gap {r.gap_bandit_minus_supervised:+,.2f}  -> {r.cheaper_family}")
 
     if len(rew):
-        print("\n=== 3. Cost-sensitive minus 0/1 reward (negative = cost-sensitive cheaper) ===")
+        print("\n=== 3. Bandits: cost-sensitive minus 0/1 reward "
+              "(negative = cost-sensitive cheaper) ===")
         print(rew.pivot(index="algorithm", columns="C_a", values="gap_cs_minus_01")
               .to_string(float_format=lambda v: f"{v:+,.2f}"))
 
+    if len(slg):
+        print("\n=== 4. Supervised: CSL minus CSD (negative = cost-sensitive learning cheaper) ===")
+        print(slg.pivot(index="model", columns="C_a", values="gap_csl_minus_csd")
+              .to_string(float_format=lambda v: f"{v:+,.2f}"))
+
     if len(settings):
-        print("\n=== 4. Does the tuned setting change with C_a? ===")
+        print("\n=== 5. Does the tuned setting change with C_a? ===")
         for r in settings.itertuples():
-            print(f"  {r.model_id:<20} {r.n_distinct_settings} distinct setting(s) "
+            print(f"  {r.model_id:<26} {r.n_distinct_settings} distinct setting(s) "
                   f"across {len(C_A_SWEEP_VALUES)} C_a values")
 
 
 def main():
     summary = main_model_summary()
-    expected = ([f"{p}_{a}" for a in BANDIT_GRIDS for p in ("CS", "LM")]
-                + ["LogisticRegression", "RandomForest", "XGBoost"])
+    expected = ([f"CB_{p}_{a}" for a in BANDIT_GRIDS for p in ("CS", "LM")]
+                + [f"SL_{v}_{m}" for m in SUPERVISED_MODELS for v in ("CSD", "CSL")])
     missing = [m for m in expected if m not in set(summary["model_id"])]
 
     ranks = rank_table(summary)
     agreement = rank_agreement(ranks)
-    fam, rew, settings = family_gap(summary), reward_gap(summary), settings_table(summary)
+    fam, rew, slg = family_gap(summary), reward_gap(summary), sl_gap(summary)
+    settings = settings_table(summary)
 
     ranks.to_csv(RANKS_CSV, index=False)
     fam.to_csv(FAMILY_GAP_CSV, index=False)
     rew.to_csv(REWARD_GAP_CSV, index=False)
+    slg.to_csv(SL_GAP_CSV, index=False)
     settings.to_csv(SETTINGS_CSV, index=False)
 
-    report(ranks, agreement, fam, rew, settings, missing)
+    report(ranks, agreement, fam, rew, slg, settings, missing)
     print(f"\nSaved {RANKS_CSV}\n      {FAMILY_GAP_CSV}\n      {REWARD_GAP_CSV}\n"
-          f"      {SETTINGS_CSV}")
+          f"      {SL_GAP_CSV}\n      {SETTINGS_CSV}")
 
 
 if __name__ == "__main__":

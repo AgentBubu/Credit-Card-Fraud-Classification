@@ -36,7 +36,9 @@ All gaps are in dollars of total cost on the test period
       feedback alone.
 
   cost of being frozen      = cost(supervised) - cost(Full-Info)
-      Both learn from true labels; only CONTINUED learning differs.
+      for both supervised versions (CSD and CSL). All of them see the
+      true label of every training transaction (CSL turns it into a
+      cost-weighted target); only CONTINUED learning differs.
 
 The Oracle is shown for scale (every model's regret is its gap to it).
 The 0/1 bandits are left out: they are not aiming at the dollar objective,
@@ -62,7 +64,7 @@ Usage
 import numpy as np
 import pandas as pd
 
-from Common.config import BANDIT_GRIDS, C_A, REFERENCE_CSV, RESULTS_DIR
+from Common.config import BANDIT_GRIDS, SUPERVISED_MODELS, C_A, REFERENCE_CSV, RESULTS_DIR
 from Common.metrics import running_curves
 from Common.registry import FAMILY_SUPERVISED
 from Common.runner import MODE_FINAL, labels_and_amounts, worker_data
@@ -72,7 +74,8 @@ COST_CSV = RESULTS_DIR / "partial_feedback_cost.csv"
 CURVES_CSV = RESULTS_DIR / "partial_feedback_curves.csv"
 
 FULL, PARTIAL, ORACLE = "FullInfoOnline", "PartialInfoOnline", "Oracle"
-CS_BANDITS = [f"CS_{a}" for a in BANDIT_GRIDS]
+CS_BANDITS = [f"CB_CS_{a}" for a in BANDIT_GRIDS]
+SUPERVISED = [f"SL_{v}_{m}" for v in ("CSD", "CSL") for m in SUPERVISED_MODELS]
 CURVE_STEP = 250        # keep every 250th transaction (plus the last) in the curve file
 
 
@@ -173,15 +176,14 @@ def report(dec, missing):
                     share = ("" if np.isnan(r.share_recovered)
                              else f"   share recovered {r.share_recovered:+.2f}")
                     std = "" if np.isnan(r.total_cost_std) else f" +/- {r.total_cost_std:,.2f}"
-                    print(f"    {r.model_id:<20} ${r.total_cost_mean:>11,.2f}{std:<14}"
+                    print(f"    {r.model_id:<26} ${r.total_cost_mean:>11,.2f}{std:<14}"
                           f" gap {r.gap_vs_full_info:>+11,.2f}{share}")
         print()
 
 
 def main():
     summary = summary_table(load_results().drop(columns="model_id"))
-    expected = [ORACLE, FULL, PARTIAL] + CS_BANDITS + ["LogisticRegression", "RandomForest",
-                                                       "XGBoost"]
+    expected = [ORACLE, FULL, PARTIAL] + CS_BANDITS + SUPERVISED
     missing = [m for m in expected if m not in set(summary["model_id"])]
 
     dec = decomposition(summary)

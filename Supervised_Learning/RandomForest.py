@@ -3,7 +3,7 @@ Supervised_Learning/RandomForest.py
 
 Random Forest (supervised track).
 
-Tuned settings (config.SL_GRIDS, 12 combinations):
+Tuned settings, CSD version (config.SL_CSD_GRIDS, 12 combinations):
   min_samples_leaf  smallest number of transactions per leaf      {1, 10}
   class_weighting   balanced / none                               (shared, base.py)
   calibration       none / platt / isotonic                       (shared, base.py)
@@ -22,12 +22,13 @@ n_jobs=-1 uses all CPU cores; results stay reproducible for a given seed.
 
 from sklearn.ensemble import RandomForestClassifier
 
-from Common.config import RANDOM_FOREST_FIXED, SL_GRIDS
-from Supervised_Learning.base import SupervisedModel
+from Common.config import RANDOM_FOREST_FIXED, SL_CSD_GRIDS, SL_CSL_GRIDS
+from Supervised_Learning.base import CostSensitiveLearningModel, SupervisedModel
 
 NAME = "RandomForest"
 DETERMINISTIC = False
-_DEFAULTS = {k: v[0] for k, v in SL_GRIDS[NAME].items()}
+_DEFAULTS = {k: v[0] for k, v in SL_CSD_GRIDS[NAME].items()}
+_CSL_DEFAULTS = {k: v[0] for k, v in SL_CSL_GRIDS[NAME].items()}
 
 
 def make_estimator(seed, class_weighting, y_train, min_samples_leaf):
@@ -42,3 +43,10 @@ def build(seed, min_samples_leaf=_DEFAULTS["min_samples_leaf"],
     """A fresh, untrained model with the given settings."""
     return SupervisedModel(NAME, make_estimator, seed, class_weighting, calibration,
                            {"min_samples_leaf": min_samples_leaf})
+
+
+def build_csl(seed, C_a, min_samples_leaf=_CSL_DEFAULTS["min_samples_leaf"], weight_cap=_CSL_DEFAULTS["weight_cap"]):
+    """A fresh, untrained CSL (cost-sensitive learning) model for one C_a.
+    Tuned settings (config.SL_CSL_GRIDS): min_samples_leaf x weight_cap."""
+    return CostSensitiveLearningModel(NAME, make_estimator, seed, C_a, weight_cap,
+                                      {"min_samples_leaf": min_samples_leaf})

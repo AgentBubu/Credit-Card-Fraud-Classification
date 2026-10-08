@@ -7,8 +7,10 @@ config.C_A_SWEEP_VALUES, and is scored on the SAME test period (the last
 30% of the stream), with the same dollar costs (Common/reward.py).
 
   Bandits (6)       EpsilonGreedy, LinUCB, LinTS x {cost-sensitive, 0/1}
-  Supervised (3)    LogisticRegression, RandomForest, XGBoost (frozen after
-                    training on the first 70%)
+                    ids CB_CS_<algorithm>, CB_LM_<algorithm>
+  Supervised (6)    LogisticRegression, RandomForest, XGBoost x {CSD, CSL},
+                    frozen after training on the first 70% (CSL: one model
+                    per C_a); ids SL_CSD_<model>, SL_CSL_<model>
   Reference (3)     Oracle, Full-Info Online, Partial-Info Online
                     (for Experiment 2, the cost of partial feedback)
 
@@ -24,7 +26,7 @@ tests), so all of them use exactly the same runs.
 Outputs
 -------
   Results/results.csv           one row per model x C_a x seed:
-        model, family, reward_type, seed, C_a, hyperparameters,
+        model (the model id), family, reward_type, seed, C_a, hyperparameters,
         TP, TN, FP, FN, fraud_loss, investigation_cost, total_cost, regret, auprc
   Results/summary.csv           mean and std over seeds per model x C_a
                                 (plus precision, recall, F1, false alarm rate)
@@ -62,7 +64,7 @@ from Common.metrics import (
     DERIVED_COLUMNS, METRIC_COLUMNS, add_classification_metrics, evaluate_decisions,
     rank_by_cost, reference_values, summarize_runs,
 )
-from Common.registry import all_specs, get_spec
+from Common.registry import all_ids, all_specs, get_spec
 from Common.runner import MODE_FINAL, get_decisions, hp_key, labels_and_amounts, worker_data
 from tuning import load_selected_settings, selected_hyperparameters
 
@@ -104,9 +106,10 @@ def make_jobs(specs, selected):
 
 
 def runs_in_parallel(job):
-    """Streams use one core each; supervised models run in the main process
-    (Random Forest already uses every core)."""
-    return get_spec(job.spec_id).kind != "supervised"
+    """Streams use one core each; supervised models (CSD and CSL) run in the
+    main process, one at a time (Random Forest already uses every core, and
+    several forests at once can run out of memory)."""
+    return not get_spec(job.spec_id).kind.startswith("supervised")
 
 
 # =====================================================================
@@ -139,7 +142,7 @@ def run_all(jobs, n_jobs=1, use_cache=True):
         done += 1
         first = out[0]
         cas = ", ".join(f"{c:g}" for c in job.C_a_values)
-        print(f"[{done:>3}/{total}] {job.spec_id:<20} seed {job.seed}  C_a {cas:<14}"
+        print(f"[{done:>3}/{total}] {job.spec_id:<26} seed {job.seed}  C_a {cas:<14}"
               f"  test cost at C_a={first['C_a']:g}: ${first['metrics']['total_cost']:>11,.2f}"
               f"   [{time.time() - t0:,.0f}s]", flush=True)
 
@@ -166,7 +169,7 @@ def results_table(results):
     rows = []
     for r in results:
         spec = get_spec(r["spec_id"])
-        rows.append({"model": spec.name, "family": spec.family,
+        rows.append({"model": spec.id, "family": spec.family,
                      "reward_type": spec.reward_type or "",
                      "seed": "" if spec.deterministic else r["seed"],   # blank: runs once
                      "C_a": r["C_a"],
@@ -183,9 +186,8 @@ def results_table(results):
 
 
 def model_id_of(row):
-    """'CS_LinTS' from model='LinTS', reward_type='cost_sensitive'."""
-    rt = row["reward_type"] if isinstance(row["reward_type"], str) else ""
-    return f"{'CS' if rt == 'cost_sensitive' else 'LM'}_{row['model']}" if rt else row["model"]
+    """The model column holds the model id, e.g. 'CB_CS_LinTS', 'SL_CSL_XGBoost'."""
+    return row["model"]
 
 
 def decisions_path(model_id, C_a):
@@ -228,7 +230,7 @@ def load_decisions(model_id, C_a):
 
 
 def load_results(path=RESULTS_CSV):
-    """results.csv with a model_id column added (e.g. 'CS_LinTS')."""
+    """results.csv with a model_id column added (e.g. 'CB_CS_LinTS')."""
     df = pd.read_csv(path, keep_default_na=False, na_values=[""])
     df["reward_type"] = df["reward_type"].fillna("")
     df["seed"] = df["seed"].astype("Int64")          # whole numbers; blank = deterministic
@@ -305,7 +307,7 @@ def main():
     print(data.summary())
     print(f"C_a values: {C_A_SWEEP_VALUES} | seeds: {list(SEEDS)} | settings: tuning.py\n")
     for s in specs:
-        print(f"  {s.id:<20} {sum(j.spec_id == s.id for j in jobs):>3} runs")
+        print(f"  {s.id:<26} {sum(j.spec_id == s.id for j in jobs):>3} runs")
     print(f"  total: {len(jobs)} runs\n")
     if args.dry_run:
         return
@@ -317,7 +319,11 @@ def main():
     new = results_table(results)
     if args.models and RESULTS_CSV.exists():          # keep the other models' rows
         old = load_results()
-        old = old[~old["model_id"].isin(new["_model_id"].unique())]
+        known = set(all_ids())
+        stale = sorted(set(old["model_id"]) - known)
+        if stale:
+            print(f"Dropped rows of models that no longer exist (old names): {stale}")
+        old = old[old["model_id"].isin(known) & ~old["model_id"].isin(new["_model_id"].unique())]
         old = old.rename(columns={"model_id": "_model_id"})
         new = pd.concat([old, new], ignore_index=True)
         order = {s.id: i for i, s in enumerate(all_specs())}

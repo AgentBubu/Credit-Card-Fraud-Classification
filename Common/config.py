@@ -99,6 +99,13 @@ BASE_SEED = SEEDS[0]
 BANDIT_ALGORITHMS = ["EpsilonGreedy", "LinUCB", "LinTS"]
 REWARD_TYPES = ["cost_sensitive", "label_matching"]          # 2 versions each
 SUPERVISED_MODELS = ["LogisticRegression", "RandomForest", "XGBoost"]
+# Each supervised model comes in two versions (see Supervised_Learning/base.py):
+#   CSD = cost-sensitive DECISION: learns the fraud label; the cost enters only
+#         in the decision rule (block if P(fraud) x amount > C_a)
+#   CSL = cost-sensitive LEARNING: learns from cost-weighted examples (target =
+#         the cost-optimal action, weight = cost of a wrong decision) and
+#         decides with P > 0.5
+SL_VARIANTS = ["CSD", "CSL"]
 REFERENCE_POLICIES = ["Oracle", "FullInfoOnline", "PartialInfoOnline"]
 
 # Training-reward units for cost-sensitive bandits: divide by C_a, so
@@ -114,12 +121,12 @@ REWARD_SCALE_MODE = "c_a_units"     # or "dollars"
 # Ties in validation cost go to the setting listed FIRST, so each grid
 # lists the previous default value first.
 
-# -- Supervised: 2 model-specific values x 2 class weightings x 3 calibrations
+# -- Supervised CSD: 2 model-specific values x 2 class weightings x 3 calibrations
 SL_CLASS_WEIGHTING = ["balanced", "none"]
 SL_CALIBRATION = ["none", "platt", "isotonic"]
 CALIBRATION_HOLDOUT = 0.20   # last 20% of each training part fits the calibrator
 
-SL_GRIDS = {
+SL_CSD_GRIDS = {
     "LogisticRegression": {"C": [1.0, 0.1],
                            "class_weighting": SL_CLASS_WEIGHTING,
                            "calibration": SL_CALIBRATION},
@@ -131,7 +138,21 @@ SL_GRIDS = {
                            "calibration": SL_CALIBRATION},
 }
 
-# Fixed (not tuned) supervised settings
+SL_GRIDS = SL_CSD_GRIDS        # older name, kept so existing imports still work
+
+# -- Supervised CSL: 4 model-specific values x 3 weight caps
+# Class weighting and calibration do not apply: the cost weights replace class
+# weighting, and the P > 0.5 rule does not need calibrated probabilities.
+# weight_cap = quantile at which the cost weights are capped (1.0 = no cap),
+# so that a single very large fraud cannot dominate training.
+SL_WEIGHT_CAPS = [1.0, 0.99, 0.95]
+SL_CSL_GRIDS = {
+    "LogisticRegression": {"C": [1.0, 0.1, 0.01, 10.0], "weight_cap": SL_WEIGHT_CAPS},
+    "RandomForest":       {"min_samples_leaf": [1, 5, 10, 20], "weight_cap": SL_WEIGHT_CAPS},
+    "XGBoost":            {"max_depth": [6, 3, 4, 8], "weight_cap": SL_WEIGHT_CAPS},
+}
+
+# Fixed (not tuned) supervised settings (the same for both versions)
 LOGREG_FIXED = dict(max_iter=2000)
 RANDOM_FOREST_FIXED = dict(n_estimators=200, max_depth=None, n_jobs=-1)
 XGBOOST_FIXED = dict(n_estimators=200, learning_rate=0.1,
@@ -161,8 +182,12 @@ def expand_grid(grid):
 
 
 def all_grids():
-    """Every tuned model's grid, keyed by model name."""
-    return {**SL_GRIDS, **BANDIT_GRIDS, **REFERENCE_GRIDS}
+    """Every tuned model's grid, keyed by model id (the ids used in Common/registry.py)."""
+    grids = {f"SL_CSD_{n}": g for n, g in SL_CSD_GRIDS.items()}
+    grids.update({f"SL_CSL_{n}": g for n, g in SL_CSL_GRIDS.items()})
+    grids.update({f"CB_{r}_{n}": g for n, g in BANDIT_GRIDS.items() for r in ("CS", "LM")})
+    grids.update(REFERENCE_GRIDS)
+    return grids
 
 # =====================================================================
 # 8. OUTPUT COLUMNS (results.csv, one row per model x seed x C_a)
@@ -213,6 +238,8 @@ def validate_config():
             assert len(values) == len(set(values)), f"{name}.{key} has duplicate values"
     assert all(v > 0 for g in BANDIT_GRIDS.values() for k, vals in g.items() for v in vals)
     assert all(0 < e < 1 for e in BANDIT_GRIDS["EpsilonGreedy"]["epsilon"])
+    assert set(SL_CSD_GRIDS) == set(SL_CSL_GRIDS) == set(SUPERVISED_MODELS)
+    assert all(0.5 < q <= 1.0 for q in SL_WEIGHT_CAPS), "weight caps are quantiles in (0.5, 1]"
     assert BOOTSTRAP_RESAMPLES >= 1000 and BOOTSTRAP_BLOCK_LENGTH >= 1
     assert 0.0 < BOOTSTRAP_ALPHA < 0.5
 

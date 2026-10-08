@@ -23,10 +23,13 @@ How each kind of model is driven (see Common/registry.py)
                (config.REWARD_SCALE_MODE), 0/1 = 1 if correct else 0.
   online_prob  per transaction: predict P(fraud) BEFORE seeing the label,
                then learn from the TRUE label (Full-Info Online).
-  supervised   fit once on the training rows, predict P(fraud).
+  supervised   (CSD) fit once on the training rows, predict P(fraud).
+  supervised_csl  (CSL) fit once per C_a on cost-weighted training rows,
+               predict P(worth blocking), block if > 0.5.
   oracle       cost-optimal action from the true label.
-Probabilities become decisions with the cost-aware rule: block if
-P(fraud) x amount > C_a.
+P(fraud) becomes a decision with the cost-aware rule: block if
+P(fraud) x amount > C_a. CSL models already learned the costs, so they
+decide with P > 0.5 instead (applying both would count the costs twice).
 
 Caching
 -------
@@ -107,6 +110,12 @@ def get_decisions(spec, hyperparameters, data, seed, C_a, mode, use_cache=True, 
                            compute=lambda: (_compute_probs(spec, hyperparameters, data, seed,
                                                            mode, use_cache),))
         return probabilities_to_actions(probs, data.amounts[lo:hi], C_a), probs
+
+    if spec.kind == "supervised_csl":
+        (probs,) = _cached(spec, hyperparameters, seed, C_a, mode, data, use_cache, verbose,
+                           compute=lambda: (_csl_probs(spec, hyperparameters, data, seed,
+                                                       C_a, mode),))
+        return csl_actions(probs), probs
 
     if spec.kind == "bandit":
         key_C_a = C_a if spec.depends_on_C_a else None
@@ -205,6 +214,28 @@ def _supervised_probs(spec, hp, data, seed, mode, use_cache):
     return joined[hp["calibration"]]
 
 
+def csl_actions(probs):
+    """CSL decision rule: block if P(worth blocking) > 0.5."""
+    from Supervised_Learning.base import CostSensitiveLearningModel
+    return (np.asarray(probs) > CostSensitiveLearningModel.THRESHOLD).astype(int)
+
+
+def _csl_probs(spec, hp, data, seed, C_a, mode):
+    """P(worth blocking) for a CSL model trained for this C_a.
+    Final: train on 0-70%, predict the test period.
+    Tuning: one model per validation window, trained on everything before it."""
+    if mode == MODE_FINAL:
+        lo = data.split_idx
+        model = spec.build(seed, hp, data, C_a).fit(data.X[:lo], data.y[:lo], data.amounts[:lo])
+        return model.predict_proba(data.X[lo:])[:, 1]
+    parts = []
+    for a, b in VALIDATION_WINDOWS:
+        tr, ev = int(data.n_total * a), int(data.n_total * b)
+        model = spec.build(seed, hp, data, C_a).fit(data.X[:tr], data.y[:tr], data.amounts[:tr])
+        parts.append(model.predict_proba(data.X[tr:ev])[:, 1])
+    return np.concatenate(parts)
+
+
 # =====================================================================
 # Running many jobs (optionally in parallel)
 # =====================================================================
@@ -263,8 +294,10 @@ def hp_key(hp):
 
 
 def _cache_path(spec, hp, seed, C_a, mode, data):
+    """spec.cache_id: models renamed after their runs were saved keep their old
+    name here, so the saved runs are still found."""
     ca = "any" if C_a is None else f"{C_a:g}"
-    return CACHE_DIR / (f"{spec.id}__{mode}__{hp_key(hp)}__seed{seed}__Ca{ca}__"
+    return CACHE_DIR / (f"{spec.cache_id}__{mode}__{hp_key(hp)}__seed{seed}__Ca{ca}__"
                         f"{_fingerprint(data)}.npz")
 
 

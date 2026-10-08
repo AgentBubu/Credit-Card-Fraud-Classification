@@ -5,7 +5,7 @@ Run this BEFORE main.py. It never touches the test period (the last 30%).
 
 What it does
 ------------
-Every model that has a tuning grid (6 bandits, 3 supervised models and the
+Every model that has a tuning grid (6 bandits, 6 supervised models and the
 two online reference learners) tries all 12 of its settings
 (config.TUNING_BUDGET: the same budget for every model) on the three
 rolling validation windows inside the training period:
@@ -24,9 +24,10 @@ to the setting listed first in the grid, which is always the old default.
 
   Random models     run with each of config.TUNING_SEEDS (3 seeds)
   Deterministic     (LogReg, XGBoost, Full-/Partial-Info Online) run once
-  C_a-dependent     (cost-sensitive bandits, Partial-Info Online) are re-run
-                    for every C_a, because their rewards contain C_a
-  C_a-independent   (supervised, 0/1 bandits, Full-Info Online) run once;
+  C_a-dependent     (cost-sensitive bandits, CSL supervised, Partial-Info
+                    Online) are re-run for every C_a, because their rewards
+                    or training weights contain C_a
+  C_a-independent   (CSD supervised, 0/1 bandits, Full-Info Online) run once;
                     their probabilities / decisions are re-scored per C_a
 
 Output
@@ -47,8 +48,9 @@ Usage
   python tuning.py --dry-run                list the work without running it
   python tuning.py --fresh                  delete the cache first
 
---models accepts model names (LinTS = both of its reward versions) or ids
-(CS_LinTS, LM_LinTS). Supervised models always run in the main process,
+--models accepts model names (LinTS = both of its reward versions, XGBoost =
+both supervised versions) or ids
+(CB_CS_LinTS, SL_CSL_XGBoost, ...). Supervised models always run in the main process,
 one at a time, because Random Forest already uses every core.
 """
 
@@ -118,9 +120,11 @@ def make_jobs(specs):
 
 def runs_in_parallel(job):
     """Bandit and online streams use one core each, so they can share a pool.
-    Supervised models run in the main process (Random Forest uses all cores,
-    and the calibration variants of a setting share one trained model)."""
-    return get_spec(job.spec_id).kind != "supervised"
+    Supervised models (both CSD and CSL) run in the main process, one at a
+    time: Random Forest already uses every core, and several forests training
+    at once can run out of memory. (CSD calibration variants of a setting
+    also share one trained model.)"""
+    return not get_spec(job.spec_id).kind.startswith("supervised")
 
 
 # =====================================================================
@@ -151,7 +155,7 @@ def _describe(job, rows, t0):
     shown = config.C_A if config.C_A in job.C_a_values else job.C_a_values[0]
     cost = np.mean([r["total_cost"] for r in rows if r["C_a"] == shown])
     ca = f"C_a={shown:g}" + (" (+all)" if len(job.C_a_values) > 1 else "")
-    return (f"{job.spec_id:<20} setting {job.setting:>2}  seed {job.seed}  {ca:<15}"
+    return (f"{job.spec_id:<26} setting {job.setting:>2}  seed {job.seed}  {ca:<15}"
             f"  mean window cost ${cost:>11,.2f}   [{time.time() - t0:,.0f}s elapsed]")
 
 
@@ -288,7 +292,7 @@ def main():
     print("Tuning plan (validation windows only; the test period is never used)")
     for s in specs:
         n = sum(j.spec_id == s.id for j in jobs)
-        print(f"  {s.id:<20} {TUNING_BUDGET} settings x {len(seeds_for(s))} seed(s)"
+        print(f"  {s.id:<26} {TUNING_BUDGET} settings x {len(seeds_for(s))} seed(s)"
               f"{' x 5 C_a' if s.depends_on_C_a else '':<9} = {n:>3} runs")
     print(f"  total: {len(jobs)} runs\n")
     if args.dry_run:
@@ -302,6 +306,11 @@ def main():
 
     if args.models and TUNING_CSV.exists():         # keep the other models' rows
         old = pd.read_csv(TUNING_CSV, keep_default_na=False, na_values=[""])
+        known = {s.id for s in tuned_specs()}
+        stale = sorted(set(old["model_id"]) - known)
+        if stale:
+            print(f"Dropped tuning rows of models that no longer exist (old names): {stale}")
+        old = old[old["model_id"].isin(known)]
         new = pd.concat([old[~old["model_id"].isin(new["model_id"].unique())], new],
                         ignore_index=True)
     new["reward_type"] = new["reward_type"].fillna("")

@@ -45,6 +45,9 @@ Comparisons (each at every C_a)
              pair on the test period can make this gap look slightly larger
              than it would on new data -- a caveat to state)
   reward     cost-sensitive vs 0/1 reward, for each bandit algorithm
+             (CB_CS_<algorithm> vs CB_LM_<algorithm>)
+  sl_cost    cost-sensitive learning vs cost-sensitive decision, for each
+             supervised model (SL_CSL_<model> vs SL_CSD_<model>)
   feedback   Partial-Info vs Full-Info Online (the cost of partial feedback)
 
 What it does NOT cover: how the models would change if they were trained
@@ -70,7 +73,7 @@ import numpy as np
 import pandas as pd
 
 from Common.config import (
-    BANDIT_GRIDS, BOOTSTRAP_ALPHA, BOOTSTRAP_BLOCK_LENGTH, BOOTSTRAP_RESAMPLES,
+    BANDIT_GRIDS, SUPERVISED_MODELS, BOOTSTRAP_ALPHA, BOOTSTRAP_BLOCK_LENGTH, BOOTSTRAP_RESAMPLES,
     BOOTSTRAP_SEED, C_A, C_A_SWEEP_VALUES, RESULTS_DIR,
 )
 from Common.metrics import decision_costs
@@ -159,8 +162,11 @@ def comparison_pairs(summary):
         if len(best) == 2:
             pairs.append(("family", C_a, best[FAMILY_BANDIT], best[FAMILY_SUPERVISED]))
         for algo in BANDIT_GRIDS:
-            if {f"CS_{algo}", f"LM_{algo}"} <= present:
-                pairs.append(("reward", C_a, f"CS_{algo}", f"LM_{algo}"))
+            if {f"CB_CS_{algo}", f"CB_LM_{algo}"} <= present:
+                pairs.append(("reward", C_a, f"CB_CS_{algo}", f"CB_LM_{algo}"))
+        for model in SUPERVISED_MODELS:
+            if {f"SL_CSL_{model}", f"SL_CSD_{model}"} <= present:
+                pairs.append(("sl_cost", C_a, f"SL_CSL_{model}", f"SL_CSD_{model}"))
         if {"PartialInfoOnline", "FullInfoOnline"} <= present:
             pairs.append(("feedback", C_a, "PartialInfoOnline", "FullInfoOnline"))
     return pairs
@@ -213,14 +219,15 @@ def report(df, check):
         print("Nothing to compare yet: run `python main.py` first.")
         return
     titles = {"family": "Best bandit (A) vs best supervised (B)",
-              "reward": "Cost-sensitive (A) vs 0/1 reward (B)",
+              "reward": "Bandits: cost-sensitive (A) vs 0/1 reward (B)",
+              "sl_cost": "Supervised: cost-sensitive learning (A) vs decision (B)",
               "feedback": "Partial-Info (A) vs Full-Info Online (B)"}
     floor = 1.0 / BOOTSTRAP_RESAMPLES
     for group, g in df.groupby("group", sort=False):
         print(f"=== {titles[group]}  (difference = A - B; negative = A cheaper) ===")
         for r in g.itertuples():
             p = f"<{floor:g}" if r.p_holm <= floor else f"{r.p_holm:.4f}"
-            print(f"  C_a=${r.C_a:<3g} {r.model_a:<18} vs {r.model_b:<18}"
+            print(f"  C_a=${r.C_a:<3g} {r.model_a:<26} vs {r.model_b:<26}"
                   f" {r.difference:>+11,.2f}   95% CI [{r.ci_low:>+11,.2f}, {r.ci_high:>+11,.2f}]"
                   f"   p(Holm) {p:>8}  {'SIGNIFICANT' if r.significant else 'not significant'}")
         print()
