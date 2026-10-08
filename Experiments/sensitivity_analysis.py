@@ -1,178 +1,205 @@
 """
 Experiments/sensitivity_analysis.py
 
-Experiment 1 -- Cost sensitivity analysis 
+Experiment 1 -- Does the conclusion depend on the investigation cost C_a?
 
 Question
 --------
-The investigation cost C_a = $10 is a judgement call, not a measured fact.
-Does the project's conclusion -- which policies do best, and whether the
-cost-sensitive reward beats the 0/1 reward -- hold up if that number is
-different? This re-runs the main comparison at C_a = $1, $5, $10, $20, $50
-and checks whether the RANKING of policies changes.
+C_a = $10 is a judgement call, not a measured fact. main.py already ran
+every model at C_a = $1, $5, $10, $20 and $50, each with the setting tuned
+for THAT C_a. This script checks whether the answers to the research
+questions change with C_a:
 
-What is re-run, and what is only re-scored
-------------------------------------------
-Everything runs on the FULL dataset for both tracks, so bandit and
-supervised results are directly comparable at every C_a (the first build
-used a small subsample for the bandits only, which made that impossible).
+  1. the ranking of the nine main models (6 bandits, 3 supervised)
+  2. which family wins: the best bandit vs the best supervised model
+  3. cost-sensitive vs 0/1 reward, algorithm by algorithm
+  4. whether the tuned settings themselves change with C_a
 
-  Cost-sensitive bandits   RE-RUN at every C_a: C_a is part of the reward
-                           they learn from, so a different C_a leads to
-                           different decisions all the way along the stream.
-  0/1 label-matching       Decisions do not depend on C_a (the 0/1 reward
-  bandits                  never involves it): computed once, re-scored at
-                           each C_a.
-  Supervised models        Trained once; only the dynamic threshold
-                           C_a / Amount moves with C_a, so they are
-                           re-thresholded, never retrained.
+How to read it
+--------------
+Dollar costs are NOT comparable ACROSS C_a values: a higher C_a makes every
+block more expensive, so everyone's cost rises. The meaningful comparisons
+are WITHIN each C_a: ranks, and dollar gaps between models. Rank agreement
+with the default C_a is measured with Spearman's rank correlation
+(1 = identical ordering, 0 = unrelated, -1 = reversed).
+Whether a gap is larger than chance is tested in Experiments/bootstrap_test.py.
 
-Supervised models use the PRIMARY (dynamic) threshold only: the flat 0.5
-threshold ignores C_a entirely, so sweeping it would show nothing.
-The C_a = $10 runs come straight from main.py's cache.
-
-How to read the results
------------------------
-Absolute dollar rewards are NOT comparable across C_a values -- a higher
-C_a makes every block more expensive, so everyone's reward shifts. The
-meaningful comparison is WITHIN each C_a: the ranking of policies, and the
-cost-sensitive vs 0/1 gap for each algorithm. The console report shows both.
+This script runs no models: it only reads main.py's output.
 
 Outputs
 -------
-  Results/sensitivity_results.csv   one row per C_a x policy x seed:
-      C_a, policy, seed, TP, TN, FP, FN,
-      precision, recall, f1, auprc, cumulative_reward, cumulative_regret
-  Results/sensitivity_summary.csv   one row per C_a x policy: n_seeds, then
-      the mean and std of every numeric column (std blank for single runs)
+  Results/sensitivity_ranks.csv        model x C_a: mean total cost, std, rank
+  Results/sensitivity_family_gap.csv   per C_a: best bandit vs best supervised
+  Results/sensitivity_reward_gap.csv   per algorithm x C_a: cost-sensitive vs 0/1
+  Results/sensitivity_settings.csv     per model: the tuned setting at each C_a
 
 Usage
 -----
   python -m Experiments.sensitivity_analysis
-  python -m Experiments.sensitivity_analysis --seeds 42 --C_a 5 10
-  python -m Experiments.sensitivity_analysis --policies CS_ XGBoost
 """
 
-import argparse
-import time
-
+import numpy as np
 import pandas as pd
+from scipy.stats import spearmanr
 
-from Common import config
-from Common.config import C_A, C_A_SWEEP_VALUES, RESULTS_DIR, SEEDS, THRESHOLD_MODE_PRIMARY
-from Common.metrics import summarize_runs
-from Common.preprocessing import prepare_data
-from Common.runner import run_policy_all_seeds
+from Common.config import BANDIT_GRIDS, C_A, C_A_SWEEP_VALUES, RESULTS_DIR, SELECTED_SETTINGS_CSV
+from Common.registry import FAMILY_BANDIT, FAMILY_SUPERVISED
+from main import load_results, summary_table
 
-# Re-use main.py's policy definitions, so both scripts run exactly the same policies.
-from main import bandit_specs, supervised_specs, _selected
+RANKS_CSV = RESULTS_DIR / "sensitivity_ranks.csv"
+FAMILY_GAP_CSV = RESULTS_DIR / "sensitivity_family_gap.csv"
+REWARD_GAP_CSV = RESULTS_DIR / "sensitivity_reward_gap.csv"
+SETTINGS_CSV = RESULTS_DIR / "sensitivity_settings.csv"
 
-RESULT_COLUMNS = [
-    "C_a", "policy", "seed", "TP", "TN", "FP", "FN",
-    "precision", "recall", "f1", "auprc", "cumulative_reward", "cumulative_regret",
-]
-ID_COLUMNS = ["C_a", "policy"]
-VALUE_COLUMNS = RESULT_COLUMNS[3:]
-
-RESULTS_CSV = RESULTS_DIR / "sensitivity_results.csv"
-SUMMARY_CSV = RESULTS_DIR / "sensitivity_summary.csv"
-
-# Algorithm pairs for the cost-sensitive vs 0/1 check at every C_a.
-ALGORITHM_PAIRS = [("EpsilonGreedy", "CS_EpsilonGreedy", "LM_EpsilonGreedy"),
-                   ("LinUCB", "CS_LinUCB", "LM_LinUCB"),
-                   ("LinTS", "CS_LinTS", "LM_LinTS"),
-                   ("BootstrappedUCB", "CS_BootstrappedUCB", "LM_BootstrappedUCB"),
-                   ("BootstrappedTS", "CS_BootstrappedTS", "LM_BootstrappedTS")]
-
-
-def run_to_row(run, spec, C_a):
-    m = run.metrics
-    return {
-        "C_a": C_a,
-        "policy": spec.name,
-        "seed": "" if spec.deterministic else run.seed,
-        **{k: m[k] for k in ("TP", "TN", "FP", "FN", "precision", "recall", "f1",
-                             "auprc", "cumulative_reward", "cumulative_regret")},
-    }
+MAIN_FAMILIES = (FAMILY_BANDIT, FAMILY_SUPERVISED)
 
 
 # =====================================================================
-# Console report: is the conclusion robust to C_a?
+# The four analyses
 # =====================================================================
-def report(summary):
-    means = summary.pivot(index="policy", columns="C_a", values="cumulative_reward_mean")
-    ranks = means.rank(ascending=False, method="min").astype(int)   # 1 = best at that C_a
-    order = ranks[C_A].sort_values().index if C_A in ranks.columns else ranks.index
+def main_model_summary():
+    """Mean/std over seeds per model x C_a, for the nine main models."""
+    s = summary_table(load_results().drop(columns="model_id"))
+    return s[s["family"].isin(MAIN_FAMILIES)].reset_index(drop=True)
 
-    print("\n=== Ranking within each C_a (1 = best; compare down each column) ===")
-    print(ranks.loc[order].to_string())
 
-    print("\n=== Best policy at each C_a ===")
-    for c in means.columns:
-        best = means[c].idxmax()
-        print(f"  C_a = ${c:>4g}: {best:22s} (mean reward ${means.loc[best, c]:,.2f})")
+def rank_table(summary):
+    """Long table: model_id, family, C_a, mean, std, rank (1 = lowest cost)."""
+    out = summary[["model_id", "family", "C_a", "total_cost_mean", "total_cost_std",
+                   "n_seeds"]].copy()
+    out["rank"] = (out.groupby("C_a")["total_cost_mean"]
+                   .rank(ascending=True, method="min").astype(int))
+    return out.sort_values(["C_a", "rank"]).reset_index(drop=True)
 
-    if C_A in ranks.columns and ranks.shape[1] > 1:
-        print(f"\n=== Rank agreement with the default C_a = ${C_A:g} "
-              f"(Spearman correlation; 1.0 = identical ordering) ===")
-        for c in ranks.columns:
-            if c != C_A:
-                rho = ranks[c].corr(ranks[C_A], method="spearman")
-                print(f"  C_a = ${c:>4g}: {rho:.3f}")
 
-    pairs = [(a, cs, lm) for a, cs, lm in ALGORITHM_PAIRS
-             if cs in means.index and lm in means.index]
-    if pairs:
-        print("\n=== Cost-sensitive advantage over 0/1 reward "
-              "(positive = cost-sensitive better), per C_a ===")
-        gap = pd.DataFrame({a: means.loc[cs] - means.loc[lm] for a, cs, lm in pairs}).T
-        with pd.option_context("display.float_format", "{:,.0f}".format):
-            print(gap.to_string())
-        wins = (gap > 0).sum()
-        print("  cost-sensitive wins: " +
-              ", ".join(f"C_a=${c:g}: {int(wins[c])}/{len(pairs)}" for c in gap.columns))
+def rank_agreement(ranks, reference_C_a=C_A):
+    """Spearman correlation of each C_a's ranking with the reference C_a's.
+    Only models present at both C_a values are compared."""
+    wide = ranks.pivot(index="model_id", columns="C_a", values="total_cost_mean")
+    rows = []
+    ref = wide[reference_C_a].to_numpy()
+    for c in wide.columns:
+        other = wide[c].to_numpy()
+        ok = ~(np.isnan(ref) | np.isnan(other))
+        rho = (float(spearmanr(ref[ok], other[ok]).statistic) if ok.sum() > 2
+               else float("nan"))
+        rows.append({"C_a": c, "spearman_vs_default": rho, "n_models": int(ok.sum())})
+    return pd.DataFrame(rows)
+
+
+def family_gap(summary):
+    """Per C_a: the best bandit, the best supervised model, and the gap
+    (bandit - supervised; negative = the best bandit is cheaper)."""
+    rows = []
+    for C_a, g in summary.groupby("C_a"):
+        best = {}
+        for fam in MAIN_FAMILIES:
+            f = g[g["family"] == fam]
+            if len(f):
+                best[fam] = f.loc[f["total_cost_mean"].idxmin()]
+        if len(best) < 2:
+            continue
+        b, s = best[FAMILY_BANDIT], best[FAMILY_SUPERVISED]
+        rows.append({"C_a": C_a,
+                     "best_bandit": b["model_id"], "best_bandit_cost": b["total_cost_mean"],
+                     "best_supervised": s["model_id"],
+                     "best_supervised_cost": s["total_cost_mean"],
+                     "gap_bandit_minus_supervised": b["total_cost_mean"] - s["total_cost_mean"],
+                     "cheaper_family": FAMILY_BANDIT if b["total_cost_mean"] < s["total_cost_mean"]
+                     else FAMILY_SUPERVISED})
+    return pd.DataFrame(rows)
+
+
+def reward_gap(summary):
+    """Per algorithm x C_a: cost-sensitive minus 0/1 mean total cost
+    (negative = the cost-sensitive reward is cheaper)."""
+    rows = []
+    for algo in BANDIT_GRIDS:
+        cs = summary[summary["model_id"] == f"CS_{algo}"].set_index("C_a")
+        lm = summary[summary["model_id"] == f"LM_{algo}"].set_index("C_a")
+        for C_a in sorted(set(cs.index) & set(lm.index)):
+            gap = cs.loc[C_a, "total_cost_mean"] - lm.loc[C_a, "total_cost_mean"]
+            rows.append({"algorithm": algo, "C_a": C_a,
+                         "cost_sensitive_cost": cs.loc[C_a, "total_cost_mean"],
+                         "cost_sensitive_std": cs.loc[C_a, "total_cost_std"],
+                         "zero_one_cost": lm.loc[C_a, "total_cost_mean"],
+                         "zero_one_std": lm.loc[C_a, "total_cost_std"],
+                         "gap_cs_minus_01": gap,
+                         "cheaper_reward": "cost_sensitive" if gap < 0 else "0/1"})
+    return pd.DataFrame(rows)
+
+
+def settings_table(summary):
+    """The tuned setting of each model at each C_a, and how many distinct
+    settings tuning chose across the C_a values."""
+    if not SELECTED_SETTINGS_CSV.exists():
+        return pd.DataFrame()
+    sel = pd.read_csv(SELECTED_SETTINGS_CSV)
+    sel = sel[sel["model_id"].isin(summary["model_id"].unique())]
+    wide = sel.pivot(index="model_id", columns="C_a", values="hyperparameters")
+    wide.columns = [f"C_a={c:g}" for c in wide.columns]
+    wide["n_distinct_settings"] = sel.groupby("model_id")["hyperparameters"].nunique()
+    return wide.reset_index()
+
+
+# =====================================================================
+# Console report
+# =====================================================================
+def _money(x):
+    return f"${x:,.2f}"
+
+
+def report(ranks, agreement, fam, rew, settings, missing):
+    if missing:
+        print(f"NOTE: not in results.csv yet, left out: {missing}\n")
+
+    print("=== 1. Rank within each C_a (1 = lowest mean total cost) ===")
+    wide = ranks.pivot(index="model_id", columns="C_a", values="rank")
+    if C_A in wide.columns:
+        wide = wide.sort_values(C_A)
+    print(wide.to_string())
+    print("\nAgreement with the ranking at the default C_a "
+          f"(${C_A:g}), Spearman's rho:")
+    for r in agreement.itertuples():
+        print(f"  C_a = ${r.C_a:>4g}: rho = {r.spearman_vs_default:+.3f}  ({r.n_models} models)")
+
+    if len(fam):
+        print("\n=== 2. Best bandit vs best supervised model ===")
+        for r in fam.itertuples():
+            print(f"  C_a = ${r.C_a:>4g}: {r.best_bandit:<18} {_money(r.best_bandit_cost):>12}"
+                  f"  vs  {r.best_supervised:<18} {_money(r.best_supervised_cost):>12}"
+                  f"   gap {r.gap_bandit_minus_supervised:+,.2f}  -> {r.cheaper_family}")
+
+    if len(rew):
+        print("\n=== 3. Cost-sensitive minus 0/1 reward (negative = cost-sensitive cheaper) ===")
+        print(rew.pivot(index="algorithm", columns="C_a", values="gap_cs_minus_01")
+              .to_string(float_format=lambda v: f"{v:+,.2f}"))
+
+    if len(settings):
+        print("\n=== 4. Does the tuned setting change with C_a? ===")
+        for r in settings.itertuples():
+            print(f"  {r.model_id:<20} {r.n_distinct_settings} distinct setting(s) "
+                  f"across {len(C_A_SWEEP_VALUES)} C_a values")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experiment 1: cost sensitivity analysis.")
-    parser.add_argument("--C_a", type=float, nargs="+", default=list(C_A_SWEEP_VALUES),
-                        help="investigation costs to sweep (default: from config)")
-    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
-    parser.add_argument("--policies", nargs="+", default=None,
-                        help="run only policies whose names contain one of these")
-    parser.add_argument("--no-cache", action="store_true")
-    args = parser.parse_args()
+    summary = main_model_summary()
+    expected = ([f"{p}_{a}" for a in BANDIT_GRIDS for p in ("CS", "LM")]
+                + ["LogisticRegression", "RandomForest", "XGBoost"])
+    missing = [m for m in expected if m not in set(summary["model_id"])]
 
-    config.ensure_directories()
-    data = prepare_data()
-    print("=== Experiment 1: cost sensitivity analysis ===")
-    print(data.summary())
-    print(f"C_a values = {args.C_a} | seeds = {args.seeds}\n")
+    ranks = rank_table(summary)
+    agreement = rank_agreement(ranks)
+    fam, rew, settings = family_gap(summary), reward_gap(summary), settings_table(summary)
 
-    specs = [s for s in bandit_specs(data.n_features + 1) + supervised_specs()
-             if _selected(s.name, args.policies)]
-    if not specs:
-        print("No policies matched --policies; nothing to do.")
-        return
+    ranks.to_csv(RANKS_CSV, index=False)
+    fam.to_csv(FAMILY_GAP_CSV, index=False)
+    rew.to_csv(REWARD_GAP_CSV, index=False)
+    settings.to_csv(SETTINGS_CSV, index=False)
 
-    rows, t_start = [], time.time()
-    for c in args.C_a:
-        print(f"--- C_a = ${c:g} ---")
-        for spec in specs:
-            runs = run_policy_all_seeds(spec, data, seeds=args.seeds, C_a=c,
-                                        threshold_mode=THRESHOLD_MODE_PRIMARY,
-                                        use_cache=not args.no_cache, verbose=True)
-            rows += [run_to_row(r, spec, c) for r in runs]
-
-    results = pd.DataFrame(rows)[RESULT_COLUMNS]
-    summary = summarize_runs(results, ID_COLUMNS, VALUE_COLUMNS)
-    results.to_csv(RESULTS_CSV, index=False)
-    summary.to_csv(SUMMARY_CSV, index=False)
-
-    report(summary)
-    print(f"\nSaved {RESULTS_CSV}")
-    print(f"Saved {SUMMARY_CSV}")
-    print(f"Total time: {(time.time() - t_start) / 60:.1f} min")
+    report(ranks, agreement, fam, rew, settings, missing)
+    print(f"\nSaved {RANKS_CSV}\n      {FAMILY_GAP_CSV}\n      {REWARD_GAP_CSV}\n"
+          f"      {SETTINGS_CSV}")
 
 
 if __name__ == "__main__":

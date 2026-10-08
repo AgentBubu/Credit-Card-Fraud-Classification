@@ -1,643 +1,814 @@
 """
-make_graphs.py
+make_graphs.py  --  Step 4: the thesis figures (PNG, saved in Graphs/).
 
-Creates the project's figures and saves them straight into Graphs/.
-Nothing is re-run: figures are drawn from the CSVs in Results/, and the
-"over time" curves are rebuilt from the cached decisions in Results/cache/.
+Run after main.py and the three experiment scripts. Nothing is re-run:
+every figure is drawn from Results/ (the CSV files, and the saved decisions
+for the regret curves), so the figures always show exactly those numbers.
 
-    python make_graphs.py               combined figures only (default)
-    python make_graphs.py --separate    ALSO the 12 separate figures
-    python make_graphs.py --no-curves   skip the regret-over-time panels
-                                        (use if the cache was deleted)
+    python make_graphs.py              figures at the default C_a ($10)
+    python make_graphs.py --C_a 50     figures 1-4 and 6a at another C_a
 
-Combined figures -> Graphs/combined/
-    A  All policies -- classification metrics (precision, recall, F1, AUPRC)
-    B  All policies -- decision quality (cumulative reward, cumulative regret)
-    C  Experiment 1 -- sensitivity to the investigation cost C_a
-    D  Experiment 2 -- the cost of partial feedback, as TWO standalone figures:
-         D_partial_feedback_left.png   cumulative reward of every policy
-         D_partial_feedback_right.png  extra cost compared with Full-Info Online
+Figures
+-------
+  fig1_standard_metrics      precision, recall, F1 and AUPRC of every model
+  fig2_decision_quality      total cost of every model, and cumulative regret
+                             over the test period, one panel per group
+  fig3_regret_all_models     cumulative regret of every model in one panel
+  fig4_cost_breakdown        total cost split into fraud loss and investigation cost
+  fig5a_ranking              Experiment 1: ranking of the models at each C_a
+  fig5b_reward_gap           Experiment 1: cost-sensitive vs 0/1 reward, per
+                             algorithm (bootstrap 95% intervals)
+  fig5c_bandit_vs_supervised Experiment 1: best bandit vs best supervised model
+                             (bootstrap 95% intervals)
+  fig6a_extra_cost           Experiment 2: each model's cost minus Full-Info Online's
+  fig6b_partial_vs_full      Experiment 2: Full-Info vs Partial-Info Online at each
+                             C_a; the gap in each pair = the cost of partial feedback
+  fig7_blocked_transactions  how many transactions each model blocks at each C_a
+  fig8_tuning_exploration    validation cost against the exploration setting
 
-Data exports -> Graphs/combined/ (the exact numbers behind two panels; each is
-built by the same function the plot uses, so CSV and figure always agree)
-    C_sensitivity_analysis_right.csv  Experiment 1, right panel: for each
-        algorithm and each investigation cost C_a,
-        difference = cost-sensitive cumulative reward - 0/1 cumulative reward
-        (mean over seeds). The x-axis of that panel is C_a, not time.
-    D_partial_feedback_cost_right.csv Experiment 2, right panel: for each policy,
-        extra cost = Full-Info Online cumulative reward - policy cumulative reward
-        (mean and std over seeds; positive = extra loss vs Full-Info Online)
-
-Separate figures (with --separate) -> Graphs/separate/
-    01-10 the pairwise comparisons, 11 = C, 12 = D (also split left / right)
+Figures 1-4 and 6a are drawn at one C_a (default $10; another C_a adds a
+suffix such as _Ca50 to the file name). The others cover every C_a.
 
 Reading the figures
 -------------------
-  - Every model has its OWN colour, the same in every figure. Line style
-    marks the family: solid = CB cost-sensitive, dashed = CB 0/1,
-    dash-dot = supervised. Bar charts are split into labelled family groups.
-  - Supervised models use the PRIMARY (dynamic) threshold only.
-  - Decision quality uses the project's two dollar metrics, unchanged:
-        cumulative reward  -- total dollar result; closer to $0 is better
-        cumulative regret  -- extra cost compared with the perfect Oracle;
-                              lower is better, 0 = perfect
+  - Every model has its OWN colour, the same in every figure:
+        ε-greedy yellow, LinUCB aqua, LinTS violet (both reward versions),
+        Logistic Regression red, Random Forest green, XGBoost blue,
+        Full-/Partial-Info Online grey.
+  - Line style marks the family: solid = bandit with cost-sensitive reward,
+    dashed = bandit with 0/1 reward, dash-dot = supervised;
+    Full-Info Online solid grey, Partial-Info Online dashed grey.
+    In bar charts, 0/1 bandits and Partial-Info Online are hatched.
   - Bars show the mean over seeds, error bars the standard deviation, dots
-    the individual seeds (one dot and no error bar = deterministic model).
-  - Values beyond the axis are clipped at the edge; their true value is
-    written on the bar or in the legend, so nothing is hidden.
-  - On recall panels, the dashed line is the Oracle's catch rate: the
-    cost-optimal share of fraud to block. 100% recall is NOT the goal.
+    the individual seeds (deterministic models run once: no error bar).
+  - Values beyond an axis are drawn at the edge with their true value
+    written next to them (▲), so nothing is hidden.
+  - Cumulative regret = extra cost compared with the Oracle, which knows
+    every label (regret 0). "Approve everything" = no fraud screening at all.
+  - Bootstrap intervals are 95%; a filled marker = significant after the
+    Holm correction, hollow = not significant.
 """
 
 import argparse
+import json
 
 import matplotlib
-matplotlib.use("Agg")                     # draw straight to files, no windows
+matplotlib.use("Agg")                      # draw straight to files, no windows
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.lines import Line2D
 
 from Common import config
-from Common.config import C_A, GRAPHS_DIR, RESULTS_DIR, THRESHOLD_MODE_PRIMARY
-from Common.metrics import reference_values, running_curves
-from Common.preprocessing import prepare_data
-from Common.reward import oracle_actions_batch
+from Common.config import BANDIT_GRIDS, C_A, GRAPHS_DIR, RESULTS_DIR, TUNING_CSV
 
 # =====================================================================
-# Models, labels, colours
+# Models, colours, styles
 # =====================================================================
-ALGORITHMS = ["EpsilonGreedy", "LinUCB", "LinTS", "BootstrappedUCB", "BootstrappedTS"]
-ALGO_LABEL = {"EpsilonGreedy": "ε-Greedy", "LinUCB": "LinUCB", "LinTS": "LinTS",
-              "BootstrappedUCB": "Boot. UCB", "BootstrappedTS": "Boot. TS"}
-CS_POLICIES = [f"CS_{a}" for a in ALGORITHMS]
-LM_POLICIES = [f"LM_{a}" for a in ALGORITHMS]
-SL_POLICIES = ["LogisticRegression", "RandomForest", "XGBoost"]
-ALL_POLICIES = CS_POLICIES + LM_POLICIES + SL_POLICIES
+INK, INK_2, INK_3, INK_4 = "#0b0b0b", "#52514e", "#8a8985", "#bdbcb6"
+GRID, SURFACE = "#e8e7e2", "#ffffff"
 
-FAMILY_CS, FAMILY_LM, FAMILY_SL = "CB cost-sensitive", "CB 0/1", "Supervised"
-FAMILY_STYLE = {FAMILY_CS: "-", FAMILY_LM: "--", FAMILY_SL: "-."}
-
-# One distinct colour per model, identical in every figure.
+# One colour per model (checked as a set for colour-blind readers; line
+# style and direct labels are the second cue).
 MODEL_COLOR = {
-    "CS_EpsilonGreedy": "#1F77B4",    "CS_LinUCB": "#17BECF",   "CS_LinTS": "#9467BD",
-    "CS_BootstrappedUCB": "#393B79",  "CS_BootstrappedTS": "#E377C2",
-    "LM_EpsilonGreedy": "#FF7F0E",    "LM_LinUCB": "#BCBD22",   "LM_LinTS": "#D62728",
-    "LM_BootstrappedUCB": "#8C564B",  "LM_BootstrappedTS": "#E6AB02",
-    "LogisticRegression": "#2CA02C",  "RandomForest": "#98DF8A", "XGBoost": "#00441B",
-    "Oracle": "#000000", "FullInfoOnline": "#7F7F7F", "PartialInfoOnline": "#C7C7C7",
+    "EpsilonGreedy": "#eda100", "LinUCB": "#1baf7a", "LinTS": "#4a3aa7",
+    "LogisticRegression": "#e34948", "RandomForest": "#008300", "XGBoost": "#2a78d6",
+    "FullInfoOnline": INK_2, "PartialInfoOnline": INK_2, "Oracle": INK,
 }
-BLACK, GREY = "#000000", "#7F7F7F"
-REF_LABEL = {"Oracle": "Oracle", "FullInfoOnline": "Full-Info Online",
-             "PartialInfoOnline": "Partial-Info Online"}
+SHORT = {"EpsilonGreedy": "ε-greedy", "LinUCB": "LinUCB", "LinTS": "LinTS",
+         "LogisticRegression": "Logistic Reg.", "RandomForest": "Random Forest",
+         "XGBoost": "XGBoost", "FullInfoOnline": "Full-Info Online",
+         "PartialInfoOnline": "Partial-Info Online", "Oracle": "Oracle"}
+FAMILY_STYLE = {"cs": "-", "lm": (0, (5, 2.5)), "sl": (0, (6, 2, 1.5, 2)),
+                "full": "-", "partial": (0, (5, 2.5)), "oracle": "-"}
 
-CLASS_METRICS = [("precision", "Precision"), ("recall", "Recall"),
-                 ("f1", "F1"), ("auprc", "AUPRC")]
+GROUPS = [   # (title, family key, model ids)
+    ("Bandit, cost-sensitive", "cs", [f"CS_{a}" for a in BANDIT_GRIDS]),
+    ("Bandit, 0/1", "lm", [f"LM_{a}" for a in BANDIT_GRIDS]),
+    ("Supervised", "sl", ["LogisticRegression", "RandomForest", "XGBoost"]),
+    ("Reference", "ref", ["FullInfoOnline", "PartialInfoOnline"]),
+]
+MAIN_MODELS = [m for _, _, ms in GROUPS[:3] for m in ms]
 
-plt.rcParams.update({"figure.dpi": 100, "savefig.dpi": 300, "font.size": 10,
-                     "axes.spines.top": False, "axes.spines.right": False})
-
-SEPARATE_DIR = GRAPHS_DIR / "separate"
-COMBINED_DIR = GRAPHS_DIR / "combined"
-
-
-def family(policy):
-    return (FAMILY_CS if policy.startswith("CS_") else
-            FAMILY_LM if policy.startswith("LM_") else FAMILY_SL)
-
-
-def label_of(policy, with_family=False):
-    """'CS_LinUCB' -> 'LinUCB' (or 'LinUCB (CB cost-sensitive)'), etc."""
-    if policy in REF_LABEL:
-        return REF_LABEL[policy]
-    base = ALGO_LABEL[policy[3:]] if policy[:3] in ("CS_", "LM_") else \
-        {"LogisticRegression": "Logistic Reg.", "RandomForest": "Random Forest"}.get(policy, policy)
-    return f"{base} ({family(policy)})" if with_family else base
-
-
-def money(v, _=None):
-    """-2500 -> '-$2,500'."""
-    return f"-${abs(v):,.0f}" if v < 0 else f"${v:,.0f}"
+plt.rcParams.update({
+    "figure.facecolor": SURFACE, "axes.facecolor": SURFACE, "savefig.facecolor": SURFACE,
+    "font.size": 9, "axes.titlesize": 10, "axes.labelsize": 9,
+    "axes.edgecolor": INK_3, "axes.labelcolor": INK_2, "xtick.color": INK_2,
+    "ytick.color": INK_2, "text.color": INK, "axes.spines.top": False,
+    "axes.spines.right": False, "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6,
+    "axes.axisbelow": True, "legend.frameon": False, "legend.fontsize": 7.5,
+    "lines.linewidth": 1.6, "lines.markersize": 5.5, "hatch.linewidth": 0.8,
+    "text.parse_math": False,              # "$" is a dollar sign, never maths
+})
 
 
-MONEY = matplotlib.ticker.FuncFormatter(money)
-THOUSANDS = matplotlib.ticker.FuncFormatter(lambda v, _: f"{v / 1000:.0f}k" if v else "0")
+def base_name(model_id):
+    return model_id[3:] if model_id[:3] in ("CS_", "LM_") else model_id
 
 
-def save(fig, *paths):
-    for p in paths:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(p, bbox_inches="tight")
-        print(f"  saved {p.relative_to(GRAPHS_DIR.parent)}")
-    plt.close(fig)
+def family_of(model_id):
+    if model_id.startswith("CS_"):
+        return "cs"
+    if model_id.startswith("LM_"):
+        return "lm"
+    return {"FullInfoOnline": "full", "PartialInfoOnline": "partial",
+            "Oracle": "oracle"}.get(model_id, "sl")
+
+
+def color_of(model_id):
+    return MODEL_COLOR[base_name(model_id)]
+
+
+def style_of(model_id):
+    return FAMILY_STYLE[family_of(model_id)]
+
+
+def label_of(model_id, long=True):
+    """'LinTS (cost-sensitive)', 'LinTS (0/1)', 'XGBoost', ..."""
+    name = SHORT[base_name(model_id)]
+    fam = family_of(model_id)
+    if fam == "cs":
+        return f"{name} ({'cost-sensitive' if long else 'CS'})"
+    if fam == "lm":
+        return f"{name} (0/1)"
+    if fam == "sl" and long and name == "Logistic Reg.":
+        return "Logistic Regression"
+    return name
+
+
+def money(x, _=None):
+    return f"−${-x:,.0f}" if x < 0 else f"${x:,.0f}"
+
+
+def spread(values, gap):
+    """Nudge label positions apart (keeping their order) so neighbours are at
+    least `gap` apart; crowded groups move symmetrically around their centre."""
+    values = np.asarray(values, dtype=float)
+    order = np.argsort(values, kind="stable")
+    pos = values[order].copy()
+    for _ in range(500):
+        moved = False
+        for i in range(1, len(pos)):
+            if pos[i] - pos[i - 1] < gap - 1e-12:
+                mid = (pos[i] + pos[i - 1]) / 2
+                pos[i - 1], pos[i] = mid - gap / 2, mid + gap / 2
+                moved = True
+        if not moved:
+            break
+    out = np.empty_like(pos)
+    out[order] = pos
+    return out
 
 
 # =====================================================================
-# Data
+# Loading
 # =====================================================================
+def read(name):
+    path = RESULTS_DIR / name
+    if not path.exists():
+        print(f"  note: {name} not found (run the script that makes it); "
+              f"the panels that need it are skipped")
+        return None
+    df = pd.read_csv(path, keep_default_na=False, na_values=[""])
+    if "reward_type" in df.columns:
+        df["reward_type"] = df["reward_type"].fillna("")
+    return df
+
+
 class Inputs:
-    """Everything the figures need, loaded once."""
+    """Everything the figures read, loaded once."""
 
-    def __init__(self):
-        self.data = prepare_data()
-        ref = reference_values(self.data.y_test, self.data.amounts_test, C_A)
-        self.oracle_reward = ref["oracle_reward"]
-        self.approve_all = ref["approve_all_reward"]
-        self.oracle_catch = ref["oracle_catch_rate"]
-        main = self._read("main_results.csv")
-        self.main = None if main is None else \
-            main[main["conversion_type"] != "Supervised Learning (flat 0.5)"].copy()
-        self.sens = self._read("sensitivity_summary.csv")
-        self.pf = self._read("partial_feedback_results.csv")
+    def __init__(self, C_a):
+        from Common.metrics import add_classification_metrics
+        from main import load_results, summary_table
+        self.C_a = float(C_a)
+        self.results = add_classification_metrics(load_results())
+        self.summary = summary_table(load_results().drop(columns="model_id"))
+        self.reference = read("reference_values.csv")
+        self.bootstrap = read("bootstrap_results.csv")
+        self._curves = None
 
-    @staticmethod
-    def _read(name):
-        path = RESULTS_DIR / name
-        if not path.exists():
-            print(f"  (missing {name} -- figures that need it are skipped)")
+    def at(self, C_a=None):
+        C_a = self.C_a if C_a is None else C_a
+        return self.summary[self.summary["C_a"] == C_a].set_index("model_id")
+
+    def seeds(self, model_id, column, C_a=None):
+        C_a = self.C_a if C_a is None else C_a
+        r = self.results
+        return r.loc[(r["model_id"] == model_id) & (r["C_a"] == C_a), column].to_numpy(float)
+
+    def ref_value(self, column):
+        if self.reference is None:
             return None
-        return pd.read_csv(path)
+        row = self.reference[self.reference["C_a"] == self.C_a]
+        return None if row.empty else float(row[column].iloc[0])
 
-    def values(self, policy, column, df=None):
-        df = self.main if df is None else df
-        return df.loc[df["policy"] == policy, column].to_numpy(dtype=float)
-
-    def present(self, policies):
-        return [p for p in policies if self.main is not None and (self.main["policy"] == p).any()]
-
-
-# =====================================================================
-# Regret over time (rebuilt from cached decisions)
-# =====================================================================
-class Curves:
-    """Mean cumulative-regret curve per policy over the test region."""
-
-    def __init__(self, inputs, enabled=True):
-        self.inputs, self.enabled, self._cache, self.specs = inputs, enabled, {}, {}
-        if not enabled:
-            return
-        from main import bandit_specs, supervised_specs      # same specs as main.py
-        d = inputs.data
-        self.specs = {s.name: s for s in bandit_specs(d.n_features + 1) + supervised_specs()}
-        y, m = d.y_test, d.amounts_test
-        self.oracle_cum = np.cumsum(np.where(oracle_actions_batch(y, m, C_A) == 1, -C_A,
-                                             np.where(y == 1, -m, 0.0)))
-        self.approve_all_regret = self.oracle_cum - np.cumsum(np.where(y == 1, -m, 0.0))
-
-    def _seeds_in_results(self, policy):
-        rows = self.inputs.main[self.inputs.main["policy"] == policy]
-        seeds = pd.to_numeric(rows["seed"], errors="coerce").dropna().astype(int).tolist()
-        return sorted(set(seeds)) or [config.BASE_SEED]
-
-    def regret(self, policy):
-        """Mean cumulative regret curve, using exactly the seeds in main_results.csv.
-        Never recomputes: if a cached run is missing, the curve is skipped."""
-        if not self.enabled or policy not in self.specs:
-            return None
-        if policy not in self._cache:
-            from Common.runner import run_policy, _cache_path
-            d, spec = self.inputs.data, self.specs[policy]
-            curves = []
-            for seed in self._seeds_in_results(policy):
-                key = C_A if (spec.kind == "bandit" and spec.training_depends_on_C_a) else None
-                if not _cache_path(spec, seed, key, d).exists():
-                    print(f"  (no cached run for {policy} seed {seed}; skipping its curve -- "
-                          f"run main.py first, or use --no-curves)")
-                    self._cache[policy] = None
-                    return None
-                run = run_policy(spec, d, seed=seed, C_a=C_A,
-                                 threshold_mode=THRESHOLD_MODE_PRIMARY, use_cache=True,
-                                 verbose=False)
-                curves.append(running_curves(run.actions, d.y_test, d.amounts_test,
-                                             C_A)["cumulative_regret"])
-            self._cache[policy] = np.mean(curves, axis=0)
-        return self._cache[policy]
+    def curves(self):
+        """{model_id: (mean, std or None)} cumulative regret after each test
+        transaction (averaged over seeds), plus 'ApproveAll'. Rebuilt from the
+        saved decisions; empty if those files are missing."""
+        if self._curves is not None:
+            return self._curves
+        from Common.metrics import decision_costs, oracle_costs
+        from Common.runner import MODE_FINAL, labels_and_amounts, worker_data
+        from main import load_decisions
+        self._curves = {}
+        labels, amounts = labels_and_amounts(worker_data(), MODE_FINAL)
+        oracle = oracle_costs(labels, amounts, self.C_a)
+        for _, _, models in GROUPS:
+            for m in models:
+                try:
+                    dec = load_decisions(m, self.C_a)
+                except FileNotFoundError:
+                    continue
+                runs = np.stack([np.cumsum(decision_costs(a, labels, amounts, self.C_a) - oracle)
+                                 for a in dec["actions"]])
+                self._curves[m] = (runs.mean(axis=0),
+                                   runs.std(axis=0, ddof=1) if len(runs) > 1 else None)
+        if self._curves:
+            self._curves["ApproveAll"] = (np.cumsum(amounts * (labels == 1) - oracle), None)
+        return self._curves
 
 
-def regret_panel(ax, curves, policies, title, show_legend=True):
-    """Cumulative regret over the test region. 0 = the perfect Oracle; lines
-    that rise far above 'approve everything' are clipped, final value in the legend."""
-    if not curves.enabled:
-        ax.text(0.5, 0.5, "curves skipped (--no-curves)", ha="center", va="center",
-                transform=ax.transAxes)
-        ax.set_axis_off()
-        return
-    step = 50                                           # thin points; shape unchanged
-    x = np.arange(len(curves.oracle_cum))[::step]
-    top = 1.4 * curves.approve_all_regret[-1]
-    ax.axhline(0, color=BLACK, lw=1.2, label="Oracle (regret = 0)")
-    ax.plot(x, curves.approve_all_regret[::step], color=GREY, lw=1.2, ls=":",
-            label="Approve everything")
-    for p in policies:
-        c = curves.regret(p)
-        if c is None:
-            continue
-        lab = label_of(p)
-        if c[-1] > top:
-            lab += f"  (off scale, final {money(c[-1])})"
-        ax.plot(x, c[::step], color=MODEL_COLOR[p], ls=FAMILY_STYLE[family(p)], lw=1.7,
-                label=lab)
-    ax.set_ylim(-0.03 * top, top)
-    ax.set_xlabel("Test-region transactions (chronological)")
-    ax.set_ylabel("Cumulative regret ($)\n(lower is better)")
-    ax.set_title(title)
-    ax.yaxis.set_major_formatter(MONEY)
-    ax.xaxis.set_major_formatter(THOUSANDS)
-    if show_legend:
-        ax.legend(fontsize=7.5, loc="upper left", frameon=False)
+def suffix(C_a):
+    return "" if float(C_a) == float(C_A) else f"_Ca{C_a:g}"
+
+
+def save(fig, name):
+    config.ensure_directories()
+    path = GRAPHS_DIR / f"{name}.png"
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  saved {path.name}")
 
 
 # =====================================================================
-# Bars
+# Grouped bars (figures 1, 2 and 6)
 # =====================================================================
-def draw_bar(ax, x, vals, color, width, ylim, fmt=lambda v: f"{v:.2f}"):
-    """Mean over seeds (bar), std (error bar), individual seeds (dots).
-    A bar beyond either axis limit is clipped there and labelled with its true mean."""
-    vals = np.asarray(vals, dtype=float)
-    mean = float(np.mean(vals))
-    std = float(np.std(vals, ddof=1)) if len(vals) > 1 else np.nan
-    lo, hi = ylim
-    clipped = mean < lo or mean > hi
-    shown = min(max(mean, lo), hi)
-    ax.bar(x, shown, width, color=color, alpha=0.9, edgecolor="white",
-           hatch=("//" if clipped else None), zorder=2)
-    if clipped:
-        y = lo + 0.04 * (hi - lo) if mean < lo else hi - 0.04 * (hi - lo)
-        ax.text(x, y, fmt(mean), ha="center", va=("bottom" if mean < lo else "top"),
-                fontsize=7.5, rotation=90, zorder=5,
-                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.9))
-        return
-    if np.isfinite(std):
-        ax.errorbar(x, mean, yerr=std, color=BLACK, capsize=2.5, lw=0.9, zorder=3)
-    jitter = np.linspace(-width * 0.25, width * 0.25, len(vals)) if len(vals) > 1 else np.zeros(1)
-    inside = (vals >= lo) & (vals <= hi)
-    ax.scatter((x + jitter)[inside], vals[inside], s=9, color=BLACK, alpha=0.55,
-               zorder=4, linewidths=0)
-
-
-def grouped_bars(ax, groups, column_values, ylim, fmt=lambda v: f"{v:.2f}"):
-    """Bars split into labelled family groups.
-    groups        : list of (group_label, [policies])
-    column_values : function policy -> array of per-seed values
-    """
-    width, x, xs, labels = 0.7, 0.0, [], []
-    bounds = []
-    for gi, (glabel, pols) in enumerate(groups):
-        pols = [p for p in pols if len(column_values(p))]
-        if not pols:
-            continue
-        if xs:
-            x += 0.8                                            # gap between groups
+def grouped_bars(ax, groups, values, ylim, fmt=lambda v: f"{v:.2f}"):
+    """values: {model_id: (mean, std, seed values)}. Groups are separated by
+    dotted lines and titled in italics above the bars."""
+    groups = [(t, f, [m for m in ms if m in values]) for t, f, ms in groups]
+    groups = [g for g in groups if g[2]]
+    xs, spans, x = {}, [], 0.0
+    for title, _, models in groups:
         start = x
-        for p in pols:
-            draw_bar(ax, x, column_values(p), MODEL_COLOR[p], width, ylim, fmt)
-            xs.append(x)
-            labels.append(label_of(p))
+        for m in models:
+            xs[m] = x
             x += 1
-        bounds.append((glabel, start, x - 1))
-    ax.set_xticks(xs)
-    ax.set_xticklabels(labels, rotation=35, ha="right")
-    ax.set_ylim(*ylim)
-    ax.set_xlim(min(xs) - 0.7, max(xs) + 0.7)
-    for i, (glabel, a, b) in enumerate(bounds):                 # group names + dividers
-        ax.text((a + b) / 2, 1.005, glabel, transform=ax.get_xaxis_transform(),
-                ha="center", va="bottom", fontsize=8.5, color="#444444", style="italic")
+        spans.append((title, start, x - 1))
+        x += 0.9
+    lo, hi = ylim
+    for m, x in xs.items():
+        mean, std, seed_vals = values[m]
+        if mean is None or np.isnan(mean):
+            ax.text(x, lo + (hi - lo) * 0.02, "n/a", ha="center", fontsize=7, color=INK_3)
+            continue
+        base = 0.0 if lo <= 0 <= hi else lo
+        shown = min(max(mean, lo), hi)
+        ax.bar(x, shown - base, bottom=base, width=0.72, color=color_of(m),
+               edgecolor=SURFACE, linewidth=0,
+               hatch="////" if family_of(m) in ("lm", "partial") else None)
+        if std is not None and not np.isnan(std):
+            ax.errorbar(x, shown, yerr=std, fmt="none", ecolor=INK, elinewidth=0.9, capsize=2.5)
+        if seed_vals is not None and len(seed_vals) > 1:
+            jitter = np.linspace(-0.16, 0.16, len(seed_vals))
+            ax.scatter(x + jitter, np.clip(seed_vals, lo, hi), s=7, color=INK, alpha=0.55,
+                       zorder=3, linewidths=0)
+        if mean > hi:
+            ax.text(x, hi, f"▲ {fmt(mean)}", ha="center", va="bottom", fontsize=6.5)
+        if mean < lo:
+            ax.text(x, lo, f"▼ {fmt(mean)}", ha="center", va="top", fontsize=6.5)
+    for i, (title, a, b) in enumerate(spans):
+        ax.text((a + b) / 2, 1.0, title, transform=ax.get_xaxis_transform(), ha="center",
+                va="bottom", fontsize=7.5, style="italic", color=INK_2)
         if i:
-            ax.axvline(a - 0.9, color="#BBBBBB", lw=0.8, ls=":", zorder=1)
+            ax.axvline(a - 0.95, color=INK_4, linestyle=":", linewidth=0.8)
+    ax.set_xticks(list(xs.values()), [label_of(m, long=False).split(" (")[0] for m in xs],
+                  rotation=35, ha="right", fontsize=7.5)
+    ax.set_ylim(lo, hi)
+    ax.grid(axis="x", visible=False)
+    ax.set_xlim(-0.7, max(xs.values()) + 0.7)
 
 
-def standard_groups(policies):
-    fams = [(FAMILY_CS, CS_POLICIES), (FAMILY_LM, LM_POLICIES), (FAMILY_SL, SL_POLICIES)]
-    return [(f, [p for p in pols if p in policies]) for f, pols in fams
-            if any(p in policies for p in pols)]
-
-
-def reward_reference_lines(ax, inputs):
-    for val, lab, ls in ((inputs.oracle_reward, "Oracle (best possible)", "--"),
-                         (inputs.approve_all, "Approve everything", ":")):
-        ax.axhline(val, color=BLACK if ls == "--" else GREY, ls=ls, lw=1, zorder=1)
-        ax.text(ax.get_xlim()[1], val, f" {lab}\n {money(val)}", va="center", fontsize=7.5)
-
-
-def reward_ylim(inputs):
-    return (1.35 * inputs.approve_all, 0.0)
+def summary_values(inp, column):
+    s = inp.at()
+    return {m: (s.loc[m, f"{column}_mean"], s.loc[m, f"{column}_std"], inp.seeds(m, column))
+            for _, _, ms in GROUPS for m in ms if m in s.index}
 
 
 # =====================================================================
-# Figure builders
+# Figure 1: standard metrics
 # =====================================================================
-def fig_classification(inputs, policies, title):
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8.5), constrained_layout=True)
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    groups = standard_groups(policies)
-    for ax, (col, name) in zip(axes.flat, CLASS_METRICS):
-        grouped_bars(ax, groups, lambda p, c=col: inputs.values(p, c), (0, 1.05))
-        ax.set_title(name, pad=16)
-        ax.set_ylabel(name)
+def fig_standard_metrics(inp):
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7.4))
+    for ax, (col, title) in zip(axes.flat, [("precision", "Precision"), ("recall", "Recall"),
+                                            ("f1", "F1"), ("auprc", "AUPRC")]):
+        grouped_bars(ax, GROUPS, summary_values(inp, col), (0, 1.05))
+        ax.set_title(title, pad=16)
+        ax.set_ylabel(title)
         if col == "recall":
-            ax.axhline(inputs.oracle_catch, color=BLACK, ls="--", lw=1, zorder=1)
-            ax.text(ax.get_xlim()[1], inputs.oracle_catch, " Oracle's\n catch rate",
-                    va="center", fontsize=7.5)
-    return fig
-
-
-def fig_decision(inputs, curves, policies, title, regret_by_family=True):
-    """Cumulative reward bars (top) + cumulative regret over time (bottom)."""
-    groups = standard_groups(policies)
-    n_bottom = len(groups) if regret_by_family else 1
-    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    grid = fig.add_gridspec(2, n_bottom, height_ratios=[1, 1])
-    top = fig.add_subplot(grid[0, :])
-    grouped_bars(top, groups, lambda p: inputs.values(p, "cumulative_reward"),
-                 reward_ylim(inputs), fmt=money)
-    reward_reference_lines(top, inputs)
-    top.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
-    top.yaxis.set_major_formatter(MONEY)
-    top.set_title("Cumulative Reward", pad=16)
-    if regret_by_family:
-        for i, (fam, pols) in enumerate(groups):
-            ax = fig.add_subplot(grid[1, i])
-            regret_panel(ax, curves, pols, f"Cumulative regret over time: {fam}")
-            if i:
-                ax.set_ylabel("")
-    else:
-        regret_panel(fig.add_subplot(grid[1, 0]), curves, policies,
-                     "Cumulative regret over time")
-    return fig
-
-
-def fig_decision_paired(inputs, curves, title):
-    """Separate figure 06: CS vs 0/1 per algorithm."""
-    fig = plt.figure(figsize=(16, 10), constrained_layout=True)
-    fig.suptitle(title, fontsize=13, fontweight="bold")
-    grid = fig.add_gridspec(2, 5, height_ratios=[1.1, 1])
-    top = fig.add_subplot(grid[0, :])
-    groups = [(ALGO_LABEL[a], [f"CS_{a}", f"LM_{a}"]) for a in ALGORITHMS]
-    grouped_bars(top, groups, lambda p: inputs.values(p, "cumulative_reward"),
-                 reward_ylim(inputs), fmt=money)
-    top.set_xticklabels([("cost-sens." if i % 2 == 0 else "0/1")
-                         for i in range(len(top.get_xticks()))], rotation=0, ha="center")
-    reward_reference_lines(top, inputs)
-    top.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
-    top.yaxis.set_major_formatter(MONEY)
-    top.set_title("Cumulative Reward", pad=16)
-    for i, a in enumerate(ALGORITHMS):
-        ax = fig.add_subplot(grid[1, i])
-        regret_panel(ax, curves, [f"CS_{a}", f"LM_{a}"], ALGO_LABEL[a], show_legend=False)
-        handles = [matplotlib.lines.Line2D([], [], color=MODEL_COLOR[p], ls=FAMILY_STYLE[family(p)],
-                                           label=family(p)) for p in (f"CS_{a}", f"LM_{a}")]
-        ax.legend(handles=handles, fontsize=7, loc="upper left", frameon=False)
-        ax.tick_params(labelsize=7.5)
-        if i:
-            ax.set_ylabel("")
-        if i != 2:
-            ax.set_xlabel("")
-    return fig
-
-
-def sensitivity_gap_table(inputs):
-    """The exact series plotted in Experiment 1's right panel.
-    One row per algorithm per C_a:
-        difference = cost-sensitive cumulative reward - 0/1 cumulative reward
-    using each policy's mean over seeds. Also used for the CSV export."""
-    means = inputs.sens.pivot(index="policy", columns="C_a", values="cumulative_reward_mean")
-    rows = []
-    for a in ALGORITHMS:
-        cs, lm = f"CS_{a}", f"LM_{a}"
-        if cs in means.index and lm in means.index:
-            for c in means.columns:
-                rows.append({
-                    "C_a": float(c),
-                    "algorithm": a,
-                    "cost_sensitive_policy": cs,
-                    "label_matching_policy": lm,
-                    "cost_sensitive_cumulative_reward_mean": float(means.loc[cs, c]),
-                    "label_matching_cumulative_reward_mean": float(means.loc[lm, c]),
-                    "difference": float(means.loc[cs, c] - means.loc[lm, c]),
-                })
-    return pd.DataFrame(rows)
-
-
-def fig_sensitivity(inputs):
-    """Experiment 1: (a) ranking of every model at each C_a,
-    (b) cost-sensitive minus 0/1 cumulative reward, per algorithm."""
-    s = inputs.sens
-    costs = sorted(s["C_a"].unique())
-    means = s.pivot(index="policy", columns="C_a", values="cumulative_reward_mean")
-    ranks = means.rank(ascending=False, method="min")            # 1 = best at that C_a
-
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(16, 7.5), constrained_layout=True,
-                                 gridspec_kw={"width_ratios": [1.25, 1]})
-    fig.suptitle("Experiment 1 — Sensitivity to the investigation cost C_a",
-                 fontsize=13, fontweight="bold")
-
-    def cost_axis(ax):
-        ax.set_xscale("log")
-        ax.set_xticks(costs)
-        ax.set_xticklabels([f"${c:g}" for c in costs])
-        ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
-        ax.axvline(C_A, color=GREY, ls=":", lw=1)
-        ax.set_xlabel("Investigation cost C_a (log scale)")
-
-    for p in [q for q in ALL_POLICIES if q in ranks.index]:
-        a1.plot(costs, ranks.loc[p, costs], color=MODEL_COLOR[p], ls=FAMILY_STYLE[family(p)],
-                marker="o", ms=6, lw=2)
-        a1.text(costs[-1] * 1.08, ranks.loc[p, costs[-1]], label_of(p, with_family=True),
-                color=MODEL_COLOR[p], va="center", fontsize=8)
-    a1.invert_yaxis()
-    a1.set_yticks(range(1, len(ranks) + 1))
-    a1.set_ylabel("Rank (1 = lowest cost at that C_a)")
-    cost_axis(a1)
-    a1.set_xlim(costs[0] * 0.85, costs[-1] * 1.05)
-    a1.set_title("Ranking of every model at each investigation cost")
-    a1.text(C_A, len(ranks) + 0.6, f"default ${C_A:g}", fontsize=8, color=GREY,
-            ha="center", va="top")
-
-    gaps = sensitivity_gap_table(inputs)                  # same numbers as the CSV
-    for j, a in enumerate(ALGORITHMS):
-        g = gaps[gaps["algorithm"] == a].sort_values("C_a")
-        if len(g):
-            a2.plot(g["C_a"], g["difference"], color=BLACK, lw=1.6, marker="osD^v"[j], ms=6,
-                    ls=["-", "--", "-.", ":", (0, (5, 1, 1, 1))][j], label=ALGO_LABEL[a])
-    a2.axhline(0, color=GREY, lw=1)
-    cost_axis(a2)
-    a2.set_ylabel("Cost-sensitive minus 0/1 cumulative reward ($)\n"
-                  "(above $0 = the cost-sensitive version did better)")
-    a2.set_title("Does the cost-sensitive reward win? (per algorithm)")
-    a2.yaxis.set_major_formatter(MONEY)
-    a2.legend(fontsize=8.5, frameon=False)
-    return fig
-
-
-def _pf_groups(inputs):
-    """Policy groups for Experiment 2, each ordered best first."""
-    df = inputs.pf
-    by_family = lambda fam: (df[df["family"] == fam].groupby("policy", sort=False)
-                             ["cumulative_reward"].mean().sort_values(ascending=False)
-                             .index.tolist())
-    return {"Reference": [p for p in ("Oracle", "FullInfoOnline", "PartialInfoOnline")
-                          if (df["policy"] == p).any()],
-            "Bandits": by_family("Bandit (partial feedback)"),
-            "Supervised": by_family("Supervised (frozen)")}
-
-
-def _pf_rewards(inputs, policy):
-    """Per-seed cumulative rewards of one policy in Experiment 2."""
-    df = inputs.pf
-    return df.loc[df["policy"] == policy, "cumulative_reward"].to_numpy(float)
-
-
-def _pf_full_info(inputs):
-    full = _pf_rewards(inputs, "FullInfoOnline")
-    return float(full.mean()) if len(full) else None
-
-
-def _pf_extra_cost(inputs, policy):
-    """Per-seed extra cost vs Full-Info Online:
-        Full-Info Online cumulative reward - policy cumulative reward
-    Positive = the policy lost more money than Full-Info Online."""
-    return _pf_full_info(inputs) - _pf_rewards(inputs, policy)
-
-
-def _pf_right_groups(inputs):
-    g = _pf_groups(inputs)
-    return [("No exploration", [p for p in ["PartialInfoOnline"] if p in g["Reference"]]),
-            ("Bandits (explore)", g["Bandits"]),
-            ("Supervised (frozen)", g["Supervised"])]
-
-
-def partial_feedback_extra_table(inputs):
-    """The exact series plotted in Experiment 2's right panel, one row per policy
-    (bar = mean over seeds, error bar = std). Also used for the CSV export."""
-    full = _pf_full_info(inputs)
-    rows = []
-    for group, pols in _pf_right_groups(inputs):
-        for p in pols:
-            extra = _pf_extra_cost(inputs, p)
-            rows.append({
-                "policy": p,
-                "group": group,
-                "n_seeds": len(extra),
-                "full_info_cumulative_reward": full,
-                "policy_cumulative_reward_mean": float(_pf_rewards(inputs, p).mean()),
-                "extra_cost_mean": float(extra.mean()),
-                "extra_cost_std": float(np.std(extra, ddof=1)) if len(extra) > 1 else np.nan,
-            })
-    return pd.DataFrame(rows)
-
-
-def fig_partial_feedback_left(inputs):
-    """Experiment 2, standalone figure 1: cumulative reward of every policy."""
-    g = _pf_groups(inputs)
-    groups = [("Reference", g["Reference"]), ("Bandits (partial feedback)", g["Bandits"]),
-              ("Supervised (frozen)", g["Supervised"])]
-    fig, ax = plt.subplots(figsize=(11, 6.5), constrained_layout=True)
-    fig.suptitle("Experiment 2 — Cumulative reward of every policy", fontsize=13,
-                 fontweight="bold")
-    grouped_bars(ax, groups, lambda p: _pf_rewards(inputs, p), reward_ylim(inputs), fmt=money)
-    reward_reference_lines(ax, inputs)
-    ax.set_ylabel("Cumulative reward ($)\n(closer to $0 is better)")
-    ax.yaxis.set_major_formatter(MONEY)
-    ax.set_title(f"All policies at C_a = ${C_A:g}", pad=16)
-    return fig
-
-
-def fig_partial_feedback_right(inputs):
-    """Experiment 2, standalone figure 2: extra cost compared with Full-Info Online."""
-    fig, ax = plt.subplots(figsize=(10, 6.5), constrained_layout=True)
-    fig.suptitle("Experiment 2 — Extra cost compared with Full-Info Online",
-                 fontsize=13, fontweight="bold")
-    if _pf_full_info(inputs) is None:
-        ax.text(0.5, 0.5, "Full-Info Online not in the results", ha="center",
-                transform=ax.transAxes)
-        return fig
-    extra = lambda p: _pf_extra_cost(inputs, p)          # same numbers as the CSV
-    partial = _pf_rewards(inputs, "PartialInfoOnline")
-    cap = 1.3 * float(extra("PartialInfoOnline").mean()) if len(partial) else 5000.0
-    grouped_bars(ax, _pf_right_groups(inputs), extra, (min(-0.1 * cap, -200), cap), fmt=money)
-    ax.axhline(0, color=GREY, lw=1)
-    ax.set_ylabel("Full-Info Online cumulative reward − policy cumulative reward ($)\n"
-                  "(extra loss; lower is better; below $0 = beat Full-Info Online)")
-    ax.yaxis.set_major_formatter(MONEY)
-    ax.set_title("What each policy costs, in dollars", pad=16)
-    return fig
-
-
-def export_csv(df, path):
-    path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
-    print(f"  saved {path.relative_to(GRAPHS_DIR.parent)}")
+            rate = inp.ref_value("oracle_catch_rate")
+            if rate is not None:
+                ax.axhline(rate, color=INK, linestyle=(0, (4, 2)), linewidth=1)
+                ax.text(1.005, rate, "Oracle's\ncatch rate", transform=ax.get_yaxis_transform(),
+                        fontsize=6.5, va="center")
+    fig.suptitle(f"All models — standard metrics on the test period (C_a = ${inp.C_a:g})",
+                 fontweight="bold", fontsize=11)
+    fig.text(0.5, -0.01, "100% recall is not the goal: under the cost rule even the Oracle "
+             "blocks only the frauds worth more than C_a (dashed line).", ha="center",
+             fontsize=7.5, color=INK_2)
+    fig.tight_layout()
+    save(fig, f"fig1_standard_metrics{suffix(inp.C_a)}")
 
 
 # =====================================================================
-# Main
+# Figure 2: decision quality (total cost + regret per group)
+# =====================================================================
+def regret_ymax(curves):
+    """Axis top: a little above 'approve everything' (a model above it does
+    worse than no screening at all and is shown off scale)."""
+    aa = curves.get("ApproveAll")
+    if aa is not None:
+        return aa[0].max() * 1.12
+    return max(v[0].max() for v in curves.values()) * 1.1
+
+
+def regret_panel(ax, curves, models, title, ymax, legend=True, bands=True):
+    n = len(next(iter(curves.values()))[0])
+    t = np.arange(1, n + 1)
+    step = max(1, n // 3000)                               # thinned for drawing only
+    handles = [Line2D([], [], color=INK, label="Oracle (regret = 0)")]
+    ax.axhline(0, color=INK, linewidth=1.1)
+    aa = curves.get("ApproveAll")
+    if aa is not None:
+        ax.plot(t[::step], aa[0][::step], color=INK_3, linestyle=(0, (1, 1.5)), linewidth=1.2)
+        handles.append(Line2D([], [], color=INK_3, linestyle=(0, (1, 1.5)),
+                              label="Approve everything"))
+    drawn = []
+    for m in models:
+        if m not in curves:
+            continue
+        mean, std = curves[m]
+        ax.plot(t[::step], np.minimum(mean[::step], ymax * 1.5), color=color_of(m),
+                linestyle=style_of(m))
+        if bands and std is not None:
+            ax.fill_between(t[::step], (mean - std)[::step], (mean + std)[::step],
+                            color=color_of(m), alpha=0.12, linewidth=0)
+        lab = label_of(m)
+        twin = next((d for d in drawn if np.abs(curves[d][0] - mean).max() < ymax * 0.01), None)
+        if twin is not None:
+            lab += f"  (on top of {label_of(twin, long=False)})"
+        drawn.append(m)
+        if mean[-1] > ymax:
+            lab += f"  (off scale, final {money(mean[-1])})"
+        handles.append(Line2D([], [], color=color_of(m), linestyle=style_of(m), label=lab))
+    ax.set_ylim(-ymax * 0.03, ymax)
+    ax.set_xlim(0, n)
+    ax.yaxis.set_major_formatter(money)
+    ax.xaxis.set_major_formatter(lambda x, _: f"{x / 1000:.0f}k")
+    ax.set_xlabel("Test transactions (in time order)")
+    if title:
+        ax.set_title(title, fontsize=9.5)
+    if legend:
+        ax.legend(handles=handles, loc="upper left", fontsize=6.8)
+
+
+def fig_decision_quality(inp):
+    curves = inp.curves()
+    fig = plt.figure(figsize=(13, 8.8))
+    gs = fig.add_gridspec(2, 4, height_ratios=[1, 1.1], hspace=0.55, wspace=0.12)
+
+    ax = fig.add_subplot(gs[0, :])
+    vals = summary_values(inp, "total_cost")
+    approve_all, oracle = inp.ref_value("approve_all_cost"), inp.ref_value("oracle_cost")
+    top = (approve_all or max(v[0] for v in vals.values())) * 1.25
+    grouped_bars(ax, GROUPS, vals, (0, top), fmt=money)
+    if oracle is not None:
+        ax.axhline(oracle, color=INK, linestyle=(0, (4, 2)), linewidth=1)
+        ax.text(1.003, oracle, f"Oracle (best possible)\n{money(oracle)}",
+                transform=ax.get_yaxis_transform(), fontsize=6.8, va="center")
+    if approve_all is not None:
+        ax.axhline(approve_all, color=INK_3, linestyle=(0, (1, 1.5)), linewidth=1.1)
+        ax.text(1.003, approve_all, f"Approve everything\n{money(approve_all)}",
+                transform=ax.get_yaxis_transform(), fontsize=6.8, va="center")
+    ax.yaxis.set_major_formatter(money)
+    ax.set_ylabel("Total cost ($)\n(lower is better)")
+    ax.set_title("Total cost on the test period", pad=16)
+
+    if curves:
+        ymax = regret_ymax(curves)
+        axes = []
+        for i, (title, _, models) in enumerate(GROUPS):
+            a = fig.add_subplot(gs[1, i], sharey=axes[0] if axes else None)
+            regret_panel(a, curves, models, f"Cumulative regret: {title}", ymax)
+            if i:
+                a.tick_params(labelleft=False)
+            axes.append(a)
+        axes[0].set_ylabel("Cumulative regret ($)\n(lower is better)")
+    else:
+        print("  note: no decision files, so fig2 has no regret panels (run main.py)")
+    fig.suptitle(f"All models — decision quality (C_a = ${inp.C_a:g})", fontweight="bold",
+                 fontsize=11, y=0.995)
+    save(fig, f"fig2_decision_quality{suffix(inp.C_a)}")
+
+
+# =====================================================================
+# Figure 3: regret of every model in one panel
+# =====================================================================
+def fig_regret_all(inp):
+    curves = inp.curves()
+    if not curves:
+        print("  skipped fig3: no decision files in Results/decisions (run main.py)")
+        return
+    models = [m for _, _, ms in GROUPS for m in ms if m in curves]
+    ymax = regret_ymax(curves)
+    fig, ax = plt.subplots(figsize=(10.5, 6.2))
+    regret_panel(ax, curves, models, "", ymax, legend=False, bands=False)
+    n = len(curves[models[0]][0])
+    ends = [(min(curves[m][0][-1], ymax * 0.985),
+             label_of(m) + (f"  (off scale, {money(curves[m][0][-1])})"
+                            if curves[m][0][-1] > ymax else "")) for m in models]
+    ends += [(curves["ApproveAll"][0][-1], "Approve everything"), (0.0, "Oracle (regret = 0)")]
+    for (y, text), y_lab in zip(ends, spread([e[0] for e in ends], ymax * 0.034)):
+        ax.annotate(text, (n, y), xytext=(n * 1.035, y_lab), fontsize=7.5, va="center",
+                    annotation_clip=False,
+                    arrowprops=dict(arrowstyle="-", color=INK_4, lw=0.6, shrinkA=1, shrinkB=0))
+    ax.set_ylabel("Cumulative regret ($), lower is better")
+    ax.set_title(f"Cumulative regret of every model over the test period (C_a = ${inp.C_a:g})"
+                 "\n(mean over seeds; the spread between seeds is shown in fig2)",
+                 fontweight="bold", loc="left")
+    ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t) for k, t in
+                       (("cs", "solid = bandit, cost-sensitive  (grey: Full-Info Online)"),
+                        ("lm", "dashed = bandit, 0/1  (grey: Partial-Info Online)"),
+                        ("sl", "dash-dot = supervised"))],
+              loc="upper left", fontsize=7.5)
+    save(fig, f"fig3_regret_all_models{suffix(inp.C_a)}")
+
+
+# =====================================================================
+# Figure 4: cost breakdown
+# =====================================================================
+def fig_cost_breakdown(inp):
+    s = inp.at()
+    models = (["Oracle"] if "Oracle" in s.index else []) + \
+             [m for _, _, ms in GROUPS for m in ms if m in s.index]
+    s = s.loc[models].sort_values("total_cost_mean", ascending=False)
+    fig, ax = plt.subplots(figsize=(8.5, 0.4 * len(s) + 1.5))
+    right = 0.0
+    for yi, (m, r) in enumerate(s.iterrows()):
+        c, hatch = color_of(m), ("////" if family_of(m) in ("lm", "partial") else None)
+        ax.barh(yi, r["fraud_loss_mean"], height=0.62, color=c, edgecolor=SURFACE,
+                hatch=hatch, linewidth=0)
+        ax.barh(yi, r["investigation_cost_mean"], left=r["fraud_loss_mean"], height=0.62,
+                color=c, alpha=0.35, edgecolor=SURFACE, hatch=hatch, linewidth=0)
+        end = r["total_cost_mean"]
+        if r["n_seeds"] > 1 and not np.isnan(r["total_cost_std"]):
+            sv = inp.seeds(m, "total_cost")
+            ax.errorbar(end, yi, xerr=r["total_cost_std"], fmt="none", ecolor=INK,
+                        elinewidth=0.9, capsize=2.5)
+            ax.scatter(sv, np.full(len(sv), yi), s=8, color=INK, alpha=0.6, zorder=3,
+                       linewidths=0)
+            end = max(end + r["total_cost_std"], sv.max())
+        right = max(right, end)
+        ax.text(end, yi, f"  {money(r['total_cost_mean'])}", va="center", fontsize=7.5)
+    ax.set_yticks(range(len(s)), [label_of(m) for m in s.index])
+    ax.xaxis.set_major_formatter(money)
+    ax.set_xlim(0, right * 1.15)
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("Total cost on the test period (lower is better)")
+    ax.set_title(f"Where the cost comes from (C_a = ${inp.C_a:g})\n"
+                 "solid part = fraud loss (missed frauds)   ·   "
+                 "pale part = investigation cost (blocked transactions)",
+                 loc="left", fontsize=9.5)
+    save(fig, f"fig4_cost_breakdown{suffix(inp.C_a)}")
+
+
+# =====================================================================
+# Figure 5: Experiment 1 (sensitivity to C_a)
+# =====================================================================
+def _ca_axis(ax, cas):
+    ax.set_xscale("log")
+    ax.set_xticks(cas, [f"${c:g}" for c in cas])
+    ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+    ax.axvline(C_A, color=INK_3, linestyle=":", linewidth=0.9)
+    ax.set_xlabel("Investigation cost C_a (log scale)")
+
+
+def _gap_points(ax, rows, flip, offsets=None):
+    """Bootstrap differences with 95% intervals. rows: [(color, marker, key, df)].
+    flip=True plots B - A instead of A - B. Filled = significant (Holm)."""
+    ax.axhline(0, color=INK_3, linewidth=0.9)
+    for color, marker, key, g in rows:
+        off = 1.0 if offsets is None else offsets[key]
+        for r in g.itertuples():
+            d, lo, hi = ((-r.difference, -r.ci_high, -r.ci_low) if flip
+                         else (r.difference, r.ci_low, r.ci_high))
+            x = r.C_a * off
+            ax.plot([x, x], [lo, hi], color=color, linewidth=1.3)
+            ax.plot(x, d, marker=marker, color=color, markersize=6.5, linestyle="none",
+                    markerfacecolor=color if r.significant else SURFACE, markeredgewidth=1.4)
+    ax.yaxis.set_major_formatter(money)
+
+
+SIG_HANDLES = [Line2D([], [], color=INK_2, marker="o", linestyle="none",
+                      label="filled = significant (Holm)"),
+               Line2D([], [], color=INK_2, marker="o", markerfacecolor=SURFACE,
+                      linestyle="none", label="hollow = not significant")]
+
+
+EXP1_TITLE = "Experiment 1 — sensitivity to the investigation cost C_a"
+EXP2_TITLE = "Experiment 2 — the cost of partial feedback"
+
+
+def fig_ranking(inp):
+    """Figure 5a: rank of every main model at each C_a."""
+    s = inp.summary[inp.summary["model_id"].isin(MAIN_MODELS)]
+    cas = sorted(s["C_a"].unique())
+    ranks = (s.pivot(index="model_id", columns="C_a", values="total_cost_mean")
+             .rank(ascending=True, method="min"))
+    fig, ax = plt.subplots(figsize=(10.5, 6))
+    for m in [m for m in MAIN_MODELS if m in ranks.index]:
+        ax.plot(cas, ranks.loc[m, cas], color=color_of(m), linestyle=style_of(m), marker="o",
+                markeredgecolor=SURFACE, markeredgewidth=1)
+    last = ranks[cas[-1]].dropna()
+    for (m, y), y_lab in zip(last.items(), spread(last.to_numpy(), 0.62)):
+        ax.annotate(label_of(m), (cas[-1], y), xytext=(cas[-1] * 1.12, y_lab), fontsize=8,
+                    va="center", annotation_clip=False)
+    _ca_axis(ax, cas)
+    ax.set_xlim(cas[0] / 1.25, cas[-1] * 1.25)
+    ax.set_yticks(range(1, len(ranks) + 1))
+    ax.set_ylim(len(ranks) + 0.5, 0.5)                      # rank 1 at the top
+    ax.set_ylabel("Rank (1 = lowest total cost at that C_a)")
+    ax.text(C_A, 1.0, f" default ${C_A:g}", transform=ax.get_xaxis_transform(), fontsize=7,
+            color=INK_3, va="bottom")
+    ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t)
+                       for k, t in (("cs", "bandit, cost-sensitive"), ("lm", "bandit, 0/1"),
+                                    ("sl", "supervised"))],
+              loc="upper left", bbox_to_anchor=(0, -0.12), ncol=3, fontsize=8)
+    ax.set_title(f"{EXP1_TITLE}\n(a) Ranking of the nine main models at each investigation cost",
+                 loc="left", fontsize=10.5)
+    save(fig, "fig5a_ranking")
+
+
+def fig_reward_gap(inp):
+    """Figure 5b: cost-sensitive vs 0/1 reward, per algorithm (bootstrap)."""
+    b = inp.bootstrap
+    if b is None or not (b["group"] == "reward").any():
+        print("  skipped fig5b: no reward comparisons in bootstrap_results.csv")
+        return
+    rw = b[b["group"] == "reward"]
+    cas = sorted(rw["C_a"].unique())
+    algos = [a for a in BANDIT_GRIDS if (rw["model_a"] == f"CS_{a}").any()]
+    markers = {"EpsilonGreedy": "o", "LinUCB": "s", "LinTS": "^"}
+    offs = dict(zip(algos, np.exp(np.linspace(-0.09, 0.09, len(algos)))))
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    _gap_points(ax, [(MODEL_COLOR[a], markers[a], a, rw[rw["model_a"] == f"CS_{a}"])
+                     for a in algos], flip=True, offsets=offs)
+    _ca_axis(ax, cas)
+    ax.set_xlim(cas[0] / 1.4, cas[-1] * 1.4)
+    ax.set_ylabel("0/1 cost − cost-sensitive cost ($)\n"
+                  "(above $0 = the cost-sensitive reward is cheaper)")
+    ax.legend(handles=[Line2D([], [], color=MODEL_COLOR[a], marker=markers[a],
+                              linestyle="none", label=SHORT[a]) for a in algos] + SIG_HANDLES,
+              loc="best", fontsize=7.5)
+    ax.set_title(f"{EXP1_TITLE}\n(b) Does the cost-sensitive reward win? "
+                 "Difference per algorithm with 95% bootstrap interval", loc="left",
+                 fontsize=10.5)
+    save(fig, "fig5b_reward_gap")
+
+
+def fig_family_gap(inp):
+    """Figure 5c: best bandit vs best supervised model (bootstrap)."""
+    b = inp.bootstrap
+    if b is None or not (b["group"] == "family").any():
+        print("  skipped fig5c: no family comparisons in bootstrap_results.csv")
+        return
+    fam = b[b["group"] == "family"].sort_values("C_a")
+    cas = sorted(fam["C_a"].unique())
+    fig, ax = plt.subplots(figsize=(8.5, 5.2))
+    _gap_points(ax, [(INK, "o", "f", fam)], flip=True)
+    _ca_axis(ax, cas)
+    ax.set_xlim(cas[0] / 1.6, cas[-1] * 1.6)
+    for i, r in enumerate(fam.itertuples()):
+        above = i % 2 == 0                                  # alternate so neighbours never touch
+        ax.annotate(f"{label_of(r.model_a, long=False)}\nvs {label_of(r.model_b)}",
+                    (r.C_a, -r.ci_low if above else -r.ci_high), textcoords="offset points",
+                    xytext=(0, 5 if above else -5), ha="center",
+                    va="bottom" if above else "top", fontsize=7, color=INK_2)
+    ax.margins(y=0.25)
+    ax.set_ylabel("best supervised cost − best bandit cost ($)\n"
+                  "(above $0 = the bandit is cheaper)")
+    ax.legend(handles=SIG_HANDLES, loc="lower left", fontsize=7.5)
+    ax.set_title(f"{EXP1_TITLE}\n(c) Best bandit vs best supervised model at each C_a, "
+                 "with 95% bootstrap interval", loc="left", fontsize=10.5)
+    save(fig, "fig5c_bandit_vs_supervised")
+
+
+# =====================================================================
+# Figure 6: Experiment 2 (cost of partial feedback)
+# =====================================================================
+def fig_extra_cost(inp):
+    """Figure 6a: each model's cost minus Full-Info Online's, at one C_a."""
+    s = inp.at()
+    if "FullInfoOnline" not in s.index:
+        print("  skipped fig6a: Full-Info Online is not in the results")
+        return
+    full = s.loc["FullInfoOnline", "total_cost_mean"]
+    groups = [("Partial feedback,\nno exploration", "ref", ["PartialInfoOnline"]),
+              ("Bandit, cost-sensitive\n(partial feedback + exploration)", "cs",
+               [f"CS_{a}" for a in BANDIT_GRIDS]),
+              ("Supervised\n(true labels, never updated)", "sl",
+               ["LogisticRegression", "RandomForest", "XGBoost"])]
+    vals = {m: (s.loc[m, "total_cost_mean"] - full, s.loc[m, "total_cost_std"],
+                inp.seeds(m, "total_cost") - full)
+            for _, _, ms in groups for m in ms if m in s.index}
+    fig, ax = plt.subplots(figsize=(9, 5.4))
+    ext = [v[0] + (0 if np.isnan(v[1]) else v[1]) for v in vals.values()]
+    low = [v[0] - (0 if np.isnan(v[1]) else v[1]) for v in vals.values()]
+    lo, hi = min(0, min(low)) * 1.25 - 1, max(0, max(ext)) * 1.15 + 1
+    top2 = sorted(v[0] for v in vals.values())[-2:]
+    if len(top2) == 2 and top2[1] > 2.5 * max(top2[0], 1):  # one extreme bar: draw it at the edge
+        hi = max(top2[0], 0) * 1.6 + 1
+    grouped_bars(ax, groups, vals, (lo, hi), fmt=money)
+    ax.axhline(0, color=INK, linewidth=1)
+    ax.yaxis.set_major_formatter(money)
+    ax.set_ylabel("Extra cost compared with Full-Info Online ($)\n"
+                  "(above $0 = costs more, below = costs less)")
+    ax.set_title(f"{EXP2_TITLE}\n(a) Each model's cost minus Full-Info Online's "
+                 f"({money(full)}) at C_a = ${inp.C_a:g}", loc="left", fontsize=10.5, pad=32)
+    save(fig, f"fig6a_extra_cost{suffix(inp.C_a)}")
+
+
+def fig_partial_vs_full(inp):
+    """Figure 6b: Full-Info and Partial-Info Online side by side at each C_a;
+    the gap between each pair is the cost of partial feedback."""
+    s = inp.summary.set_index(["model_id", "C_a"])["total_cost_mean"]
+    if "FullInfoOnline" not in s.index.get_level_values(0) or \
+            "PartialInfoOnline" not in s.index.get_level_values(0):
+        print("  skipped fig6b: Full-/Partial-Info Online are not in the results")
+        return
+    cas = sorted(set(s.loc["FullInfoOnline"].index) & set(s.loc["PartialInfoOnline"].index))
+    b = inp.bootstrap
+    fb = (b[b["group"] == "feedback"].set_index("C_a") if b is not None
+          else pd.DataFrame())
+    fig, ax = plt.subplots(figsize=(9, 5.4))
+    x = np.arange(len(cas))
+    w = 0.36
+    full = np.array([s.loc[("FullInfoOnline", c)] for c in cas])
+    part = np.array([s.loc[("PartialInfoOnline", c)] for c in cas])
+    ax.bar(x - w / 2, full, width=w, color=INK_4, label="Full-Info Online (told every label)")
+    ax.bar(x + w / 2, part, width=w, color=INK_2, hatch="////", edgecolor=SURFACE, linewidth=0,
+           label="Partial-Info Online (learns only from approved transactions)")
+    top = max(part.max(), full.max())
+    for xi, c, f, p in zip(x, cas, full, part):
+        ax.text(xi - w / 2, f, money(f), ha="center", va="bottom", fontsize=7, color=INK_2)
+        ax.text(xi + w / 2, p, money(p), ha="center", va="bottom", fontsize=7, color=INK_2)
+        verdict = ""
+        if c in fb.index:
+            verdict = "\nsignificant" if bool(fb.loc[c, "significant"]) else "\nnot significant"
+        y = max(f, p) + top * 0.09
+        gap = p - f
+        ax.annotate(f"gap {'+' if gap >= 0 else ''}{money(gap)}{verdict}", (xi, y),
+                    ha="center", va="bottom", fontsize=8,
+                    fontweight="bold" if "\nsignificant" in verdict else "normal")
+        ax.plot([xi - w / 2, xi - w / 2, xi + w / 2, xi + w / 2],
+                [f + top * 0.045, y - top * 0.015, y - top * 0.015, p + top * 0.045],
+                color=INK_3, linewidth=0.8)
+    ax.set_xticks(x, [f"${c:g}" for c in cas])
+    ax.set_xlabel("Investigation cost C_a")
+    ax.set_ylabel("Total cost on the test period ($)")
+    ax.yaxis.set_major_formatter(money)
+    ax.set_ylim(0, top * 1.38)
+    ax.grid(axis="x", visible=False)
+    ax.legend(loc="upper left", fontsize=7.5)
+    ax.set_title(f"{EXP2_TITLE}\n(b) Same learner, different feedback: the gap in each pair is "
+                 "the cost of partial feedback\n(significance: paired block bootstrap, "
+                 "Holm-corrected)", loc="left", fontsize=10.5)
+    save(fig, "fig6b_partial_vs_full")
+
+
+# =====================================================================
+# Figure 7: blocked transactions at each C_a
+# =====================================================================
+def fig_blocked(inp):
+    s = inp.summary.assign(blocked=inp.summary["TP_mean"] + inp.summary["FP_mean"])
+    cas = sorted(s["C_a"].unique())
+    shown_models = ["Oracle", "FullInfoOnline"] + MAIN_MODELS
+    rest = s[s["model_id"].isin(shown_models) & (s["C_a"] > cas[0])]["blocked"]
+    cap = float(rest.max()) * 1.15 if len(rest) else 200.0  # everything fits except the smallest C_a
+    fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.8), sharey=True)
+    for ax, (title, _, models) in zip(axes, GROUPS[:3]):
+        for m in ["Oracle", "FullInfoOnline"] + models:
+            g = s[s["model_id"] == m].set_index("C_a").reindex(cas)["blocked"]
+            if g.isna().all():
+                continue
+            ref = m in ("Oracle", "FullInfoOnline")
+            off = {c: v for c, v in g.items() if v > cap}
+            label = label_of(m) + "".join(f"  (${c:g}: {v:,.0f} ▲)" for c, v in off.items())
+            ax.plot(cas, np.minimum(g, cap), color=color_of(m),
+                    linestyle=(0, (1, 1.5)) if m == "Oracle" else style_of(m), marker="o",
+                    markersize=4.5, markeredgecolor=SURFACE, linewidth=1.2 if ref else 1.7,
+                    label=label)
+            for c in off:
+                ax.plot(c, cap, marker="^", color=color_of(m), markersize=6, zorder=4)
+        _ca_axis(ax, cas)
+        ax.set_ylim(0, cap * 1.05)
+        ax.set_title(title, fontsize=9.5)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=6.8)
+    axes[0].set_ylabel("Transactions blocked on the test period\n(caught frauds + false alarms)")
+    fig.suptitle("How many transactions each model blocks as investigation gets more expensive\n"
+                 "(▲ = above the axis; the true value is in the legend)", fontweight="bold",
+                 fontsize=10.5)
+    fig.tight_layout()
+    save(fig, "fig7_blocked_transactions")
+
+
+# =====================================================================
+# Figure 8: tuning -- validation cost vs exploration
+# =====================================================================
+EXPLORATION_PARAM = {"EpsilonGreedy": "epsilon", "LinUCB": "alpha", "LinTS": "v"}
+EXPLORATION_LABEL = {"EpsilonGreedy": "ε (exploration rate)", "LinUCB": "α (optimism bonus)",
+                     "LinTS": "v (posterior scale)"}
+
+
+def fig_tuning(C_a=C_A):
+    if not TUNING_CSV.exists():
+        print("  skipped fig8: tuning_results.csv not found")
+        return
+    t = pd.read_csv(TUNING_CSV)
+    t = t[(t["C_a"] == C_a) & (t["family"] == "Bandit")]
+    if t.empty:
+        return
+    hp = t["hyperparameters"].map(json.loads)
+    t = t.assign(ridge=hp.map(lambda h: h["ridge"]),
+                 explore=[h[EXPLORATION_PARAM[m]] for h, m in zip(hp, t["model"])])
+    agg = t.groupby(["model", "reward_type", "ridge", "explore"])["total_cost"].mean().reset_index()
+    sel = read("selected_settings.csv")
+    ridges = sorted(agg["ridge"].unique())
+    ridge_style = dict(zip(ridges, ["-", (0, (5, 2.5)), (0, (1, 1.5))]))
+    fig, axes = plt.subplots(2, 3, figsize=(11, 6.4))
+    for i, (rt, rt_label, prefix) in enumerate([("cost_sensitive", "cost-sensitive", "CS"),
+                                                ("label_matching", "0/1", "LM")]):
+        for j, algo in enumerate(BANDIT_GRIDS):
+            ax = axes[i, j]
+            g = agg[(agg["model"] == algo) & (agg["reward_type"] == rt)]
+            for ridge in ridges:
+                gr = g[g["ridge"] == ridge].sort_values("explore")
+                ax.plot(gr["explore"], gr["total_cost"], marker="o", markersize=4,
+                        color=MODEL_COLOR[algo], linestyle=ridge_style[ridge],
+                        label=f"ridge {ridge:g}")
+            if sel is not None:
+                r = sel[(sel["model_id"] == f"{prefix}_{algo}") & (sel["C_a"] == C_a)]
+                if len(r):
+                    h = json.loads(r["hyperparameters"].iloc[0])
+                    ax.scatter(h[EXPLORATION_PARAM[algo]], r["val_cost_mean"].iloc[0], s=120,
+                               facecolors="none", edgecolors=INK, linewidths=1.3, zorder=4)
+            values = sorted(g["explore"].unique())
+            ax.set_xscale("log")
+            ax.set_xticks(values, [f"{v:g}" for v in values])
+            ax.xaxis.set_minor_locator(matplotlib.ticker.NullLocator())
+            ax.yaxis.set_major_formatter(money)
+            ax.tick_params(labelsize=7)
+            ax.set_title(f"{SHORT[algo]} ({rt_label})", fontsize=9)
+            if i == 1:
+                ax.set_xlabel(EXPLORATION_LABEL[algo], fontsize=8)
+            if j == 0:
+                ax.set_ylabel("Mean validation cost", fontsize=8)
+            ax.legend(fontsize=6.3, loc="best")
+    fig.suptitle(f"Tuning at C_a = ${C_a:g}: validation cost for each exploration setting "
+                 "(circle = chosen setting; further left = less exploration)",
+                 fontweight="bold", fontsize=10.5)
+    fig.tight_layout()
+    save(fig, "fig8_tuning_exploration")
+
+
+# =====================================================================
+# Command line
 # =====================================================================
 def main():
-    parser = argparse.ArgumentParser(description="Create the project figures in Graphs/.")
-    parser.add_argument("--separate", action="store_true",
-                        help="also create the 12 separate figures in Graphs/separate/")
-    parser.add_argument("--no-curves", action="store_true",
-                        help="skip the regret-over-time panels")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="Draw the thesis figures from Results/.")
+    ap.add_argument("--C_a", type=float, default=C_A,
+                    help=f"C_a for figures 1-4 and 6a (default {C_A:g})")
+    args = ap.parse_args()
 
-    config.ensure_directories()
-    print("Loading results ...")
-    inputs = Inputs()
-    curves = Curves(inputs, enabled=not args.no_curves)
-    C, S = COMBINED_DIR, SEPARATE_DIR
-
-    print("Combined figures:")
-    if inputs.main is not None:
-        everyone = inputs.present(ALL_POLICIES)
-        save(fig_classification(inputs, everyone, "All policies — Standard metrics"),
-             C / "A_all_standard.png")
-        save(fig_decision(inputs, curves, everyone, "All policies — Decision quality"),
-             C / "B_all_decision_quality.png")
-    if inputs.sens is not None:
-        fig = fig_sensitivity(inputs)
-        save(fig, C / "C_sensitivity_analysis.png",
-             *([S / "11_sensitivity_analysis.png"] if args.separate else []))
-        export_csv(sensitivity_gap_table(inputs), C / "C_sensitivity_analysis_right.csv")
-    if inputs.pf is not None:
-        save(fig_partial_feedback_left(inputs), C / "D_partial_feedback_left.png",
-             *([S / "12_partial_feedback_left.png"] if args.separate else []))
-        save(fig_partial_feedback_right(inputs), C / "D_partial_feedback_right.png",
-             *([S / "12_partial_feedback_right.png"] if args.separate else []))
-        if _pf_full_info(inputs) is not None:
-            export_csv(partial_feedback_extra_table(inputs), C / "D_partial_feedback_cost_right.csv")
-
-    if args.separate and inputs.main is not None:
-        print("Separate figures:")
-        cs, lm, sl = (inputs.present(CS_POLICIES), inputs.present(LM_POLICIES),
-                      inputs.present(SL_POLICIES))
-        specs = [
-            ("01_CB01_classification", fig_classification, lm, "CB 0/1 — Classification metrics"),
-            ("02_CB01_decision_quality", fig_decision, lm, "CB 0/1 — Decision quality"),
-            ("03_CBcost_classification", fig_classification, cs,
-             "CB cost-sensitive — Classification metrics"),
-            ("04_CBcost_decision_quality", fig_decision, cs, "CB cost-sensitive — Decision quality"),
-            ("05_CB01_vs_CBcost_classification", fig_classification, cs + lm,
-             "CB 0/1 vs CB cost-sensitive — Classification metrics"),
-            ("06_CB01_vs_CBcost_decision_quality", None, None,
-             "CB 0/1 vs CB cost-sensitive — Decision quality"),
-            ("07_CB01_vs_SL_classification", fig_classification, lm + sl,
-             "CB 0/1 vs Supervised Learning — Classification metrics"),
-            ("08_CB01_vs_SL_decision_quality", fig_decision, lm + sl,
-             "CB 0/1 vs Supervised Learning — Decision quality"),
-            ("09_CBcost_vs_SL_classification", fig_classification, cs + sl,
-             "CB cost-sensitive vs Supervised Learning — Classification metrics"),
-            ("10_CBcost_vs_SL_decision_quality", fig_decision, cs + sl,
-             "CB cost-sensitive vs Supervised Learning — Decision quality"),
-        ]
-        for name, builder, pols, title in specs:
-            if builder is None:
-                fig = fig_decision_paired(inputs, curves, title)
-            elif builder is fig_decision:
-                fig = builder(inputs, curves, pols, title)
-            else:
-                fig = builder(inputs, pols, title)
-            save(fig, S / f"{name}.png")
-    print(f"Done. Figures are in {GRAPHS_DIR}")
+    if not (RESULTS_DIR / "results.csv").exists():
+        raise SystemExit("Results/results.csv not found: run main.py first.")
+    inp = Inputs(args.C_a)
+    if inp.at().empty:
+        raise SystemExit(f"No results at C_a = {args.C_a:g}.")
+    print(f"Drawing figures into {GRAPHS_DIR}")
+    fig_standard_metrics(inp)
+    fig_decision_quality(inp)
+    fig_regret_all(inp)
+    fig_cost_breakdown(inp)
+    fig_ranking(inp)
+    fig_reward_gap(inp)
+    fig_family_gap(inp)
+    fig_extra_cost(inp)
+    fig_partial_vs_full(inp)
+    fig_blocked(inp)
+    fig_tuning()
 
 
 if __name__ == "__main__":

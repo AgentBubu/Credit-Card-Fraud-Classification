@@ -1,219 +1,196 @@
 """
 Experiments/partial_feedback_cost.py
 
-Experiment 2 -- The cost of partial feedback
+Experiment 2 -- What does partial feedback cost?
 
 Question
 --------
-Why aren't the bandits perfect? Two structural handicaps are easy to mix
-up, so this experiment measures them separately, each against the same
-reference policy -- Full-Info Online (Experiments/reference_policies.py),
-which keeps learning through the whole stream like a bandit, but is told
-the TRUE LABEL after every transaction like a supervised model:
+A bandit only learns what happened after the action it TOOK: under the
+cost rule, approving reveals the label (cost $0 or the amount) but blocking
+reveals nothing ($C_a either way). How much money does that limitation
+cost, and how much of it do the bandits win back by exploring?
 
-    clean cost of partial feedback = reward(Full-Info) - reward(Partial-Info)
-        Partial-Info Online is Full-Info Online's exact twin (same model,
-        same threshold) that learns only from transactions it APPROVED --
-        under the cost matrix, blocking reveals nothing. ONLY the feedback
-        differs. It has no exploration, so this is what partial feedback
-        costs when nothing is done about it.
+The yardstick is Full-Info Online (Experiments/reference_policies.py): an
+online logistic regression that keeps learning through the whole stream
+like a bandit, but is told the TRUE LABEL after every transaction.
+All gaps are in dollars of total cost on the test period
+(positive = more expensive than the yardstick):
 
-    bandit gap                     = reward(Full-Info) - reward(bandit)
-        The bandits also get partial feedback, but EXPLORE to counter it
-        (and model the decision differently). The share of the clean loss
-        each bandit recovers shows what its exploration buys:
-            recovered = (bandit - Partial-Info) / (Full-Info - Partial-Info)
+  cost of partial feedback  = cost(Partial-Info) - cost(Full-Info)
+      Partial-Info Online is Full-Info Online's exact twin (same learner,
+      same decision rule) that learns only from transactions it APPROVED,
+      with no exploration. Only the feedback differs, so this is the clean
+      price of partial feedback when nothing is done about it.
 
-    cost of being frozen           = reward(Full-Info) - reward(supervised)
-        Both learn from true labels; only CONTINUED LEARNING differs.
-        (A supervised model is trained once and never updated.)
+  bandit gap                = cost(bandit) - cost(Full-Info)
+      The cost-sensitive bandits also get partial feedback, but explore.
+      share recovered = (cost(Partial-Info) - cost(bandit))
+                        / (cost(Partial-Info) - cost(Full-Info))
+      1 = the bandit closes the whole gap, 0 = no better than not
+      exploring, below 0 = worse than not exploring, above 1 = better
+      than full information. Only reported when the cost of partial
+      feedback is positive (otherwise there is nothing to recover).
+      Note the bandits also differ from Full-Info Online in model form
+      (linear reward models vs logistic P(fraud)), so the bandit gap mixes
+      feedback with model form; the Partial-Info twin is what isolates
+      feedback alone.
 
-Positive = the handicap costs money; negative = the policy beat the
-reference despite it. The Oracle (cost-optimal with perfect knowledge) is
-included for scale -- every policy's regret is its gap to the Oracle --
-but is NOT used for the decomposition, because that gap also contains the
-ordinary cost of having to learn at all.
+  cost of being frozen      = cost(supervised) - cost(Full-Info)
+      Both learn from true labels; only CONTINUED learning differs.
 
-Policies (all at one C_a, default $10, scored on the same test region)
-----------------------------------------------------------------------
-  Oracle                       family "Oracle"
-  Full-Info Online             family "Full-Info Online"
-  Partial-Info Online          family "Partial-Info Online"
-  5 cost-sensitive bandits     family "Bandit (partial feedback)"
-  3 supervised models          family "Supervised (frozen)"  -- PRIMARY
-                               (dynamic) threshold, the same decision rule
-                               Full-Info Online uses
+The Oracle is shown for scale (every model's regret is its gap to it).
+The 0/1 bandits are left out: they are not aiming at the dollar objective,
+so their gap would mix reward design into the comparison.
 
-Cost-sensitive bandits are used (not the 0/1 ones) because they, like
-Full-Info Online, are aiming at the dollar objective; comparing a 0/1
-bandit with Full-Info Online would mix reward design into the gap.
-
-Why Partial-Info Online is needed: Full-Info Online is a logistic model of
-P(fraud) plus the dynamic threshold, while the cost-sensitive bandits
-learn dollar costs with linear models, so the plain bandit gap mixes
-feedback with model form (Experiment 1 showed model form matters). The
-Partial-Info twin isolates the feedback exactly.
-
-Nearly everything here is already cached by main.py (all bandits and
-supervised models at C_a = $10); only the three reference policies are
-new, and all are fast and deterministic.
+All models used the setting tuned at each C_a (tuning.py), Full-Info and
+Partial-Info Online included, so the cost of partial feedback compares two
+equally tuned learners. This script runs no models: it reads main.py's
+output.
 
 Outputs
 -------
-  Results/partial_feedback_results.csv   one row per policy per seed:
-      policy, family, seed, TP, TN, FP, FN,
-      precision, recall, f1, auprc, cumulative_reward, cumulative_regret
-  Results/partial_feedback_summary.csv   one row per policy: n_seeds, then
-      the mean and std of every numeric column (std blank for single runs)
-  The decomposition itself is printed to the console.
+  Results/partial_feedback_cost.csv    per C_a x model: cost, std and the gaps
+  Results/partial_feedback_curves.csv  cumulative regret over the test period
+                                       at the default C_a (mean and std over
+                                       seeds), for the regret-curve figure
 
 Usage
 -----
   python -m Experiments.partial_feedback_cost
-  python -m Experiments.partial_feedback_cost --seeds 42 --policies CS_ XGBoost
 """
 
-import argparse
-import time
-
+import numpy as np
 import pandas as pd
 
-from Common import config
-from Common.config import C_A, RESULTS_DIR, SEEDS, THRESHOLD_MODE_PRIMARY
-from Common.metrics import summarize_runs
-from Common.preprocessing import prepare_data
-from Common.runner import run_policy_all_seeds
-from Experiments.reference_policies import (
-    oracle_spec, full_info_online_spec, partial_info_online_spec,
-)
+from Common.config import BANDIT_GRIDS, C_A, REFERENCE_CSV, RESULTS_DIR
+from Common.metrics import running_curves
+from Common.registry import FAMILY_SUPERVISED
+from Common.runner import MODE_FINAL, labels_and_amounts, worker_data
+from main import load_decisions, load_results, summary_table
 
-# Re-use main.py's policy definitions, so every script runs the same policies.
-from main import bandit_specs, supervised_specs, _selected, CS_GROUP
+COST_CSV = RESULTS_DIR / "partial_feedback_cost.csv"
+CURVES_CSV = RESULTS_DIR / "partial_feedback_curves.csv"
 
-RESULT_COLUMNS = [
-    "policy", "family", "seed", "TP", "TN", "FP", "FN",
-    "precision", "recall", "f1", "auprc", "cumulative_reward", "cumulative_regret",
-]
-ID_COLUMNS = ["policy", "family"]
-VALUE_COLUMNS = RESULT_COLUMNS[3:]
-
-FAMILY_ORACLE = "Oracle"
-FAMILY_FULL_INFO = "Full-Info Online"
-FAMILY_PARTIAL_INFO = "Partial-Info Online"
-FAMILY_BANDIT = "Bandit (partial feedback)"
-FAMILY_FROZEN = "Supervised (frozen)"
-
-RESULTS_CSV = RESULTS_DIR / "partial_feedback_results.csv"
-SUMMARY_CSV = RESULTS_DIR / "partial_feedback_summary.csv"
-
-
-def run_to_row(run, spec, family):
-    m = run.metrics
-    return {
-        "policy": spec.name,
-        "family": family,
-        "seed": "" if spec.deterministic else run.seed,
-        **{k: m[k] for k in ("TP", "TN", "FP", "FN", "precision", "recall", "f1",
-                             "auprc", "cumulative_reward", "cumulative_regret")},
-    }
+FULL, PARTIAL, ORACLE = "FullInfoOnline", "PartialInfoOnline", "Oracle"
+CS_BANDITS = [f"CS_{a}" for a in BANDIT_GRIDS]
+CURVE_STEP = 250        # keep every 250th transaction (plus the last) in the curve file
 
 
 # =====================================================================
-# Console report: the decomposition
+# The decomposition
 # =====================================================================
-def report(summary, C_a):
-    r = summary.set_index("policy")
-    print(f"\n=== All policies at C_a = ${C_a:g}, best first ===")
-    view = summary[["policy", "family", "n_seeds", "cumulative_reward_mean",
-                    "cumulative_reward_std", "cumulative_regret_mean"]]
-    with pd.option_context("display.width", 160, "display.float_format", "{:,.2f}".format):
-        print(view.sort_values("cumulative_reward_mean", ascending=False).to_string(index=False))
+def role_of(model_id, family):
+    if model_id in (ORACLE, FULL, PARTIAL):
+        return "reference"
+    if model_id in CS_BANDITS:
+        return "bandit"
+    if family == FAMILY_SUPERVISED:
+        return "supervised"
+    return None                                   # 0/1 bandits: not part of Experiment 2
 
-    if "FullInfoOnline" not in r.index:
-        print("\n(Full-Info Online was not run, so the decomposition is skipped.)")
-        return
-    ref = r.loc["FullInfoOnline", "cumulative_reward_mean"]
-    print(f"\nReference: Full-Info Online reward = ${ref:,.2f}")
 
-    partial = None
-    if "PartialInfoOnline" in r.index:
-        partial = r.loc["PartialInfoOnline", "cumulative_reward_mean"]
-        print(f"\n=== CLEAN COST OF PARTIAL FEEDBACK = Full-Info - Partial-Info "
-              f"(same model; only the feedback differs; no exploration) ===")
-        print(f"  ${ref - partial:,.2f}   (Partial-Info Online reward = ${partial:,.2f})")
-
-    rows = r[r["family"] == FAMILY_BANDIT]
-    if not rows.empty and partial is not None and ref != partial:
-        print("\n=== Share of that loss each bandit RECOVERS through exploration ===")
-        print("    (bandit - Partial-Info) / (Full-Info - Partial-Info); "
-              "1.0 = as good as full information")
-        for name, row in rows.sort_values("cumulative_reward_mean", ascending=False).iterrows():
-            share = (row["cumulative_reward_mean"] - partial) / (ref - partial)
-            print(f"  {name:22s} {share:>7.2f}")
-
-    for family, label, explain in (
-        (FAMILY_BANDIT, "BANDIT GAP TO FULL INFORMATION",
-         "partial feedback + exploration + different model form"),
-        (FAMILY_FROZEN, "COST OF BEING FROZEN",
-         "both learn from true labels; only continued learning differs"),
-    ):
-        rows = r[r["family"] == family]
-        if rows.empty:
+def decomposition(summary):
+    rows = []
+    for C_a, g in summary.groupby("C_a"):
+        cost = g.set_index("model_id")["total_cost_mean"]
+        if FULL not in cost or PARTIAL not in cost:
             continue
-        print(f"\n=== {label} = Full-Info Online - policy  ({explain}) ===")
-        print("    positive = the handicap costs money; negative = policy beat the reference")
-        for name, row in rows.sort_values("cumulative_reward_mean", ascending=False).iterrows():
-            gap = ref - row["cumulative_reward_mean"]
-            std = row["cumulative_reward_std"]
-            spread = "" if pd.isna(std) else f"   (policy reward std across seeds: ${std:,.2f})"
-            print(f"  {name:22s} ${gap:>12,.2f}{spread}")
+        full, partial = cost[FULL], cost[PARTIAL]
+        pf = partial - full                                  # cost of partial feedback
+        for r in g.itertuples():
+            role = role_of(r.model_id, r.family)
+            if role is None:
+                continue
+            row = {"C_a": C_a, "model_id": r.model_id, "role": role,
+                   "n_seeds": r.n_seeds, "total_cost_mean": r.total_cost_mean,
+                   "total_cost_std": r.total_cost_std, "regret_mean": r.regret_mean,
+                   "gap_vs_full_info": r.total_cost_mean - full,
+                   "gap_vs_partial_info": r.total_cost_mean - partial,
+                   "cost_of_partial_feedback": pf,
+                   "share_recovered": np.nan}
+            if role == "bandit" and pf > 0:
+                row["share_recovered"] = (partial - r.total_cost_mean) / pf
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    if len(out):
+        order = {"reference": 0, "bandit": 1, "supervised": 2}
+        out["_o"] = out["role"].map(order)
+        out = out.sort_values(["C_a", "_o", "total_cost_mean"]).drop(columns="_o")
+    return out.reset_index(drop=True)
+
+
+# =====================================================================
+# Regret curves (default C_a)
+# =====================================================================
+def regret_curves(model_ids, C_a=C_A):
+    """Cumulative regret after each test transaction, averaged over seeds,
+    thinned to every CURVE_STEP-th transaction (the last one always kept)."""
+    labels, amounts = labels_and_amounts(worker_data(), MODE_FINAL)
+    n = len(labels)
+    keep = np.unique(np.r_[np.arange(CURVE_STEP - 1, n, CURVE_STEP), n - 1])
+    frames = []
+    for model_id in model_ids:
+        try:
+            dec = load_decisions(model_id, C_a)
+        except FileNotFoundError:
+            continue
+        curves = np.stack([running_curves(a, labels, amounts, C_a)["cumulative_regret"]
+                           for a in dec["actions"]])[:, keep]
+        frames.append(pd.DataFrame({
+            "model_id": model_id, "C_a": C_a, "transaction": keep + 1,
+            "cumulative_regret_mean": curves.mean(axis=0),
+            "cumulative_regret_std": curves.std(axis=0, ddof=1) if len(curves) > 1 else np.nan,
+            "n_seeds": len(curves)}))
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+
+
+# =====================================================================
+# Console report
+# =====================================================================
+def report(dec, missing):
+    if missing:
+        print(f"NOTE: not in results.csv yet, left out: {missing}\n")
+    if dec.empty:
+        print("Full-Info and Partial-Info Online are needed: run `python main.py` first.")
+        return
+    oracle = (pd.read_csv(REFERENCE_CSV).set_index("C_a")["oracle_cost"]
+              if REFERENCE_CSV.exists() else pd.Series(dtype=float))
+
+    for C_a, g in dec.groupby("C_a"):
+        cost = g.set_index("model_id")["total_cost_mean"]
+        print(f"=== C_a = ${C_a:g} ===")
+        if C_a in oracle.index:
+            print(f"  Oracle (lowest possible)       ${oracle[C_a]:>11,.2f}")
+        print(f"  Full-Info Online               ${cost[FULL]:>11,.2f}")
+        print(f"  Partial-Info Online            ${cost[PARTIAL]:>11,.2f}")
+        print(f"  -> cost of partial feedback    ${cost[PARTIAL] - cost[FULL]:>+11,.2f}")
+        for role, title in (("bandit", "bandit gap (vs Full-Info)"),
+                            ("supervised", "cost of being frozen (vs Full-Info)")):
+            sub = g[g["role"] == role]
+            if len(sub):
+                print(f"  {title}:")
+                for r in sub.itertuples():
+                    share = ("" if np.isnan(r.share_recovered)
+                             else f"   share recovered {r.share_recovered:+.2f}")
+                    std = "" if np.isnan(r.total_cost_std) else f" +/- {r.total_cost_std:,.2f}"
+                    print(f"    {r.model_id:<20} ${r.total_cost_mean:>11,.2f}{std:<14}"
+                          f" gap {r.gap_vs_full_info:>+11,.2f}{share}")
+        print()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Experiment 2: cost of partial feedback.")
-    parser.add_argument("--C_a", type=float, default=C_A,
-                        help="investigation cost for this experiment (default: config C_A)")
-    parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
-    parser.add_argument("--policies", nargs="+", default=None,
-                        help="run only policies whose names contain one of these "
-                             "(Oracle and FullInfoOnline are matched by name too)")
-    parser.add_argument("--no-cache", action="store_true")
-    args = parser.parse_args()
+    summary = summary_table(load_results().drop(columns="model_id"))
+    expected = [ORACLE, FULL, PARTIAL] + CS_BANDITS + ["LogisticRegression", "RandomForest",
+                                                       "XGBoost"]
+    missing = [m for m in expected if m not in set(summary["model_id"])]
 
-    config.ensure_directories()
-    data = prepare_data()
-    print("=== Experiment 2: cost of partial feedback ===")
-    print(data.summary())
-    print(f"C_a = ${args.C_a:g} | seeds = {args.seeds}\n")
+    dec = decomposition(summary)
+    dec.to_csv(COST_CSV, index=False)
+    curves = regret_curves([m for m in expected if m != ORACLE and m not in missing])
+    curves.to_csv(CURVES_CSV, index=False)
 
-    plan = [(oracle_spec(), FAMILY_ORACLE),
-            (full_info_online_spec(data.n_features + 1), FAMILY_FULL_INFO),
-            (partial_info_online_spec(data, args.C_a), FAMILY_PARTIAL_INFO)]
-    plan += [(s, FAMILY_BANDIT) for s in bandit_specs(data.n_features + 1)
-             if s.group == CS_GROUP]
-    plan += [(s, FAMILY_FROZEN) for s in supervised_specs()]
-    plan = [(s, f) for s, f in plan if _selected(s.name, args.policies)]
-    if not plan:
-        print("No policies matched --policies; nothing to do.")
-        return
-
-    rows, t_start = [], time.time()
-    for spec, family in plan:
-        print(f"[{family}] {spec.name}")
-        runs = run_policy_all_seeds(spec, data, seeds=args.seeds, C_a=args.C_a,
-                                    threshold_mode=THRESHOLD_MODE_PRIMARY,
-                                    use_cache=not args.no_cache, verbose=True)
-        rows += [run_to_row(run, spec, family) for run in runs]
-
-    results = pd.DataFrame(rows)[RESULT_COLUMNS]
-    summary = summarize_runs(results, ID_COLUMNS, VALUE_COLUMNS)
-    results.to_csv(RESULTS_CSV, index=False)
-    summary.to_csv(SUMMARY_CSV, index=False)
-
-    report(summary, args.C_a)
-    print(f"\nSaved {RESULTS_CSV}")
-    print(f"Saved {SUMMARY_CSV}")
-    print(f"Total time: {(time.time() - t_start) / 60:.1f} min")
+    report(dec, missing)
+    print(f"Saved {COST_CSV}\n      {CURVES_CSV}")
 
 
 if __name__ == "__main__":

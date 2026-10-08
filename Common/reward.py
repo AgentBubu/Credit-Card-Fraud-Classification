@@ -6,8 +6,8 @@ Every rule that turns a DECISION into a NUMBER lives here, and only here:
   1. Cost-sensitive reward  -- the shared dollar ledger. Used (a) as the
      training signal for the cost-sensitive bandits, and (b) to re-score
      EVERY policy's decisions for the final, apples-to-apples comparison.
-  2. 0/1 label-matching reward -- the training signal for the
-     LabelMatching01 bandits only. Never used for final evaluation.
+  2. 0/1 label-matching reward -- the training signal for the 0/1
+     version of each bandit. Never used for final evaluation.
   3. Oracle -- the best possible action/reward if the true label were
      known in advance. Used ONLY to compute regret, never shown to a
      policy as input.
@@ -16,7 +16,7 @@ Every rule that turns a DECISION into a NUMBER lives here, and only here:
 
 Each rule comes in a scalar form (one transaction -- used inside the
 per-transaction online loops) and a batch form (a whole array at once --
-used for supervised models and batch bandits). Both forms MUST give the
+used for supervised models and scoring). Both forms MUST give the
 same numbers for the same inputs.
 
 Action convention (from config): APPROVE = 0 (predict legit),
@@ -27,7 +27,7 @@ BLOCK = 1 (predict fraud). This lines up with the confusion matrix:
 
 import numpy as np
 
-from Common.config import APPROVE, BLOCK, C_A, FLAT_THRESHOLD
+from Common.config import APPROVE, BLOCK, C_A
 
 
 # =====================================================================
@@ -141,7 +141,7 @@ def oracle_cost_sensitive_reward_batch(labels, amounts, C_a=C_A):
 # Used by the supervised models and by Full-Info Online, which output
 # P(fraud) rather than an action.
 #
-# "dynamic" (PRIMARY) -- Bayes minimum-risk threshold:
+# Bayes minimum-risk threshold (Elkan 2001; Hoppner et al. 2022):
 #     E[cost | Approve] = P(fraud) * amount
 #     E[cost | Block]   = C_a
 #     Block is cheaper when P(fraud) > C_a / amount
@@ -149,9 +149,6 @@ def oracle_cost_sensitive_reward_batch(labels, amounts, C_a=C_A):
 # guaranteed investigation cost already exceeds the largest possible
 # loss), so such transactions are never blocked. A $0 transaction is
 # never blocked either.
-#
-# "flat" (SECONDARY) -- a fixed 0.5 cutoff that ignores the cost matrix,
-# kept only as a side comparison.
 #
 # Blocking requires P(fraud) to be STRICTLY greater than the threshold.
 
@@ -169,32 +166,18 @@ def dynamic_thresholds_batch(amounts, C_a=C_A):
     return np.where(amounts > 0, np.minimum(C_a / safe, 1.0), 1.0)
 
 
-def probability_to_action(p_fraud, amount, mode="dynamic", C_a=C_A,
-                          flat_threshold=FLAT_THRESHOLD):
-    """Turn ONE predicted fraud probability into an action."""
-    if mode == "dynamic":
-        t = dynamic_threshold(amount, C_a)
-    elif mode == "flat":
-        t = flat_threshold
-    else:
-        raise ValueError(f"Unknown threshold mode {mode!r}; use 'dynamic' or 'flat'.")
-    return BLOCK if p_fraud > t else APPROVE
+def probability_to_action(p_fraud, amount, C_a=C_A):
+    """Turn ONE predicted fraud probability into an action (cost-aware rule)."""
+    return BLOCK if p_fraud > dynamic_threshold(amount, C_a) else APPROVE
 
 
-def probabilities_to_actions(p_fraud, amounts, mode="dynamic", C_a=C_A,
-                             flat_threshold=FLAT_THRESHOLD):
-    """Turn MANY predicted fraud probabilities into actions."""
+def probabilities_to_actions(p_fraud, amounts, C_a=C_A):
+    """Turn MANY predicted fraud probabilities into actions (cost-aware rule)."""
     p_fraud = np.asarray(p_fraud, dtype=float)
     amounts = np.asarray(amounts, dtype=float)
     if p_fraud.shape != amounts.shape:
         raise ValueError("p_fraud and amounts must have the same shape.")
-    if mode == "dynamic":
-        t = dynamic_thresholds_batch(amounts, C_a)
-    elif mode == "flat":
-        t = np.full_like(p_fraud, flat_threshold)
-    else:
-        raise ValueError(f"Unknown threshold mode {mode!r}; use 'dynamic' or 'flat'.")
-    return np.where(p_fraud > t, BLOCK, APPROVE)
+    return np.where(p_fraud > dynamic_thresholds_batch(amounts, C_a), BLOCK, APPROVE)
 
 
 # =====================================================================
