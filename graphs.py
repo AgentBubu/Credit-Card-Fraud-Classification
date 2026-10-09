@@ -16,7 +16,7 @@ Figures
   fig3_regret_all_models     cumulative regret of every model in one panel
   fig4_cost_breakdown        total cost split into fraud loss and investigation cost
   fig5a_ranking              Experiment 1: ranking of the models at each C_a
-  fig5b_reward_gap           Experiment 1: bandits, cost-sensitive vs 0/1 reward,
+  fig5b_reward_gap           Experiment 1: bandits, CSL (cost-sensitive reward) vs 0/1,
                              per algorithm (bootstrap 95% intervals)
   fig5c_bandit_vs_supervised Experiment 1: best bandit vs best supervised model
                              (bootstrap 95% intervals)
@@ -39,7 +39,7 @@ Reading the figures
         Logistic Regression red, Random Forest green, XGBoost blue,
         Full-/Partial-Info Online grey.
   - Line style marks the version:
-        solid        = bandit, cost-sensitive reward (CB_CS)
+        solid        = bandit, CSL: cost-sensitive reward (CB_CS)
         dashed       = bandit, 0/1 reward (CB_LM)
         dash-dot     = supervised, cost-sensitive decision (SL_CSD)
         dash-dot-dot = supervised, cost-sensitive learning (SL_CSL)
@@ -95,7 +95,7 @@ FAMILY_STYLE = {"cs": "-", "lm": (0, (5, 2.5)), "csd": (0, (6, 2, 1.5, 2)),
 HATCHED = ("lm", "csd", "partial")         # learning does not use the costs
 
 GROUPS = [   # (title, family key, model ids)
-    ("Bandit, cost-sensitive", "cs", [f"CB_CS_{a}" for a in BANDIT_GRIDS]),
+    ("Bandit, CSL", "cs", [f"CB_CS_{a}" for a in BANDIT_GRIDS]),
     ("Bandit, 0/1", "lm", [f"CB_LM_{a}" for a in BANDIT_GRIDS]),
     ("Supervised, CSD", "csd", [f"SL_CSD_{m}" for m in SUPERVISED_MODELS]),
     ("Supervised, CSL", "csl", [f"SL_CSL_{m}" for m in SUPERVISED_MODELS]),
@@ -139,12 +139,12 @@ def style_of(model_id):
 
 
 def label_of(model_id, long=True):
-    """'LinTS (cost-sensitive)', 'LinTS (0/1)', 'XGBoost (CSD)', 'XGBoost (CSL)', ..."""
+    """'LinTS (CSL)', 'LinTS (0/1)', 'XGBoost (CSD)', 'XGBoost (CSL)', ..."""
     name = SHORT[base_name(model_id)]
     fam = family_of(model_id)
     if long and name == "Logistic Reg.":
         name = "Logistic Regression"
-    suffix_ = {"cs": "cost-sensitive" if long else "CS", "lm": "0/1",
+    suffix_ = {"cs": "CSL", "lm": "0/1",
                "csd": "CSD", "csl": "CSL"}.get(fam)
     return f"{name} ({suffix_})" if suffix_ else name
 
@@ -450,11 +450,10 @@ def fig_regret_all(inp):
                     annotation_clip=False,
                     arrowprops=dict(arrowstyle="-", color=INK_4, lw=0.6, shrinkA=1, shrinkB=0))
     ax.set_ylabel("Cumulative regret ($), lower is better")
-    ax.set_title(f"Cumulative regret of every model over the test period (C_a = ${inp.C_a:g})"
-                 "\n(mean over seeds; the spread between seeds is shown in fig2)",
+    ax.set_title(f"Cumulative regret of every model over the test period (C_a = ${inp.C_a:g})",
                  fontweight="bold", loc="left")
     ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t) for k, t in
-                       (("cs", "solid = bandit, cost-sensitive  (grey: Full-Info Online)"),
+                       (("cs", "solid = bandit, CSL  (grey: Full-Info Online)"),
                         ("lm", "dashed = bandit, 0/1  (grey: Partial-Info Online)"),
                         ("csd", "dash-dot = supervised, CSD"),
                         ("csl", "dash-dot-dot = supervised, CSL"))],
@@ -533,8 +532,8 @@ SIG_HANDLES = [Line2D([], [], color=INK_2, marker="o", linestyle="none",
                       linestyle="none", label="hollow = not significant")]
 
 
-EXP1_TITLE = "Experiment 1 — sensitivity to the investigation cost C_a"
-EXP2_TITLE = "Experiment 2 — the cost of partial feedback"
+EXP1_TITLE = "Sensitivity To The Investigation Cost C_a"
+EXP2_TITLE = "The Cost of Partial Feedback"
 
 
 def fig_ranking(inp):
@@ -559,16 +558,16 @@ def fig_ranking(inp):
     ax.text(C_A, 1.0, f" default ${C_A:g}", transform=ax.get_xaxis_transform(), fontsize=7,
             color=INK_3, va="bottom")
     ax.legend(handles=[Line2D([], [], color=INK_2, linestyle=FAMILY_STYLE[k], label=t)
-                       for k, t in (("cs", "bandit, cost-sensitive"), ("lm", "bandit, 0/1"),
+                       for k, t in (("cs", "bandit, CSL"), ("lm", "bandit, 0/1"),
                                     ("csd", "supervised, CSD"), ("csl", "supervised, CSL"))],
               loc="upper left", bbox_to_anchor=(0, -0.12), ncol=4, fontsize=8)
-    ax.set_title(f"{EXP1_TITLE}\n(a) Ranking of the twelve main models at each investigation cost",
+    ax.set_title(f"{EXP1_TITLE}\nRanking of the twelve main models at each investigation cost",
                  loc="left", fontsize=10.5)
     save(fig, "fig5a_ranking")
 
 
 def fig_reward_gap(inp):
-    """Figure 5b: cost-sensitive vs 0/1 reward, per algorithm (bootstrap)."""
+    """Figure 5b: CSL (cost-sensitive reward) vs 0/1 reward, per algorithm (bootstrap)."""
     b = inp.bootstrap
     if b is None or not (b["group"] == "reward").any():
         print("  skipped fig5b: no reward comparisons in bootstrap_results.csv")
@@ -583,13 +582,12 @@ def fig_reward_gap(inp):
                      for a in algos], flip=True, offsets=offs)
     _ca_axis(ax, cas)
     ax.set_xlim(cas[0] / 1.4, cas[-1] * 1.4)
-    ax.set_ylabel("0/1 cost − cost-sensitive cost ($)\n"
-                  "(above $0 = the cost-sensitive reward is cheaper)")
+    ax.set_ylabel("0/1 cost − CSL cost ($)\n"
+                  "(above $0 = the CSL bandit is cheaper)")
     ax.legend(handles=[Line2D([], [], color=MODEL_COLOR[a], marker=markers[a],
                               linestyle="none", label=SHORT[a]) for a in algos] + SIG_HANDLES,
               loc="best", fontsize=7.5)
-    ax.set_title(f"{EXP1_TITLE}\n(b) Bandits: does the cost-sensitive reward win? "
-                 "Difference per algorithm with 95% bootstrap interval", loc="left",
+    ax.set_title(f"{EXP1_TITLE}\nBandits: does CSL (the cost-sensitive reward) win? ", loc="left",
                  fontsize=10.5)
     save(fig, "fig5b_reward_gap")
 
@@ -616,8 +614,7 @@ def fig_family_gap(inp):
     ax.set_ylabel("best supervised cost − best bandit cost ($)\n"
                   "(above $0 = the bandit is cheaper)")
     ax.legend(handles=SIG_HANDLES, loc="lower left", fontsize=7.5)
-    ax.set_title(f"{EXP1_TITLE}\n(c) Best bandit vs best supervised model at each C_a, "
-                 "with 95% bootstrap interval", loc="left", fontsize=10.5)
+    ax.set_title(f"{EXP1_TITLE}\nBest Bandit vs Best Supervised Model at Each C_a, ", loc="left", fontsize=10.5)
     save(fig, "fig5c_bandit_vs_supervised")
 
 
@@ -643,9 +640,8 @@ def fig_csl_vs_csd(inp):
     ax.legend(handles=[Line2D([], [], color=MODEL_COLOR[m], marker=markers[m],
                               linestyle="none", label=label_of(f"SL_CSD_{m}").split(" (")[0])
                        for m in models] + SIG_HANDLES, loc="best", fontsize=7.5)
-    ax.set_title(f"{EXP1_TITLE}\n(d) Supervised: does cost-sensitive learning beat the "
-                 "cost-sensitive decision rule?\nDifference per model with 95% bootstrap "
-                 "interval", loc="left", fontsize=10.5)
+    ax.set_title(f"{EXP1_TITLE}\nSupervised: Does Cost-Sensitive Learning Beat the "
+                 "Cost-Sensitive Decision Rule?", loc="left", fontsize=10.5)
     save(fig, "fig5d_csl_vs_csd")
 
 
@@ -660,7 +656,7 @@ def fig_extra_cost(inp):
         return
     full = s.loc["FullInfoOnline", "total_cost_mean"]
     groups = [("Partial feedback,\nno exploration", "ref", ["PartialInfoOnline"]),
-              ("Bandit, cost-sensitive\n(partial feedback + exploration)", "cs",
+              ("Bandit, CSL\n(partial feedback + exploration)", "cs",
                [f"CB_CS_{a}" for a in BANDIT_GRIDS]),
               ("Supervised, CSD\n(never updated)", "csd",
                [f"SL_CSD_{m}" for m in SUPERVISED_MODELS]),
@@ -767,7 +763,7 @@ def fig_blocked(inp):
         axes[i].set_ylabel("Transactions blocked on the test period\n"
                            "(caught frauds + false alarms)")
     fig.suptitle("How many transactions each model blocks as investigation gets more expensive\n"
-                 "(▲ = above the axis; the true value is in the legend)", fontweight="bold",
+                 "(▲ = above the axis)", fontweight="bold",
                  fontsize=10.5)
     fig.tight_layout()
     save(fig, "fig7_blocked_transactions")
@@ -797,7 +793,7 @@ def fig_tuning(C_a=C_A):
     ridges = sorted(agg["ridge"].unique())
     ridge_style = dict(zip(ridges, ["-", (0, (5, 2.5)), (0, (1, 1.5))]))
     fig, axes = plt.subplots(2, 3, figsize=(11, 6.4))
-    for i, (rt, rt_label, prefix) in enumerate([("cost_sensitive", "cost-sensitive", "CS"),
+    for i, (rt, rt_label, prefix) in enumerate([("cost_sensitive", "CSL", "CS"),
                                                 ("label_matching", "0/1", "LM")]):
         for j, algo in enumerate(BANDIT_GRIDS):
             ax = axes[i, j]
