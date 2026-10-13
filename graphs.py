@@ -1,12 +1,12 @@
 """
-graphs.py  --  Step 4: the thesis figures (PNG, saved in Graphs/).
+make_graphs.py  --  Step 4: the thesis figures (PNG, saved in Graphs/).
 
 Run after main.py and the three experiment scripts. Nothing is re-run:
 every figure is drawn from Results/ (the CSV files, and the saved decisions
 for the regret curves), so the figures always show exactly those numbers.
 
-    python graphs.py              figures at the default C_a ($10)
-    python graphs.py --C_a 50     figures 1-4 and 6a at another C_a
+    python make_graphs.py              figures at the default C_a ($10)
+    python make_graphs.py --C_a 50     figures 1-4, 6a and 9 at another C_a
 
 Figures
 -------
@@ -27,8 +27,11 @@ Figures
                              C_a; the gap in each pair = the cost of partial feedback
   fig7_blocked_transactions  how many transactions each model blocks at each C_a
   fig8_tuning_exploration    validation cost against the exploration setting
+  fig9_net_saving            net saving of each model (prevented fraud loss minus
+                             investigation cost), and its share of the Oracle's
+  fig10_frauds_caught        how many frauds each model catches at each C_a
 
-Figures 1-4 and 6a are drawn at one C_a (default $10; another C_a adds a
+Figures 1-4, 6a and 9 are drawn at one C_a (default $10; another C_a adds a
 suffix such as _Ca50 to the file name). The others cover every C_a.
 
 Reading the figures
@@ -829,12 +832,196 @@ def fig_tuning(C_a=C_A):
 
 
 # =====================================================================
+# Figure 9: net saving compared with no screening
+# =====================================================================
+def fig_net_saving(inp):
+    """Net saving = prevented fraud loss - investigation cost
+                  = cost of approving everything - the model's total cost.
+    The Oracle's net saving is the most any model can reach, so each bar is
+    also labelled with its share of that maximum (equivalently 1 - regret /
+    the Oracle's net saving). Calculated here; nothing extra is stored in
+    Results/.
+
+    The axis starts at $0. Anything below $0 (a seed, the end of an error
+    bar, or a negative mean) is cut off at the $0 line, marked with ◀ and
+    its true value written in the bar's label, so nothing is hidden."""
+    approve_all, oracle = inp.ref_value("approve_all_cost"), inp.ref_value("oracle_cost")
+    if approve_all is None:
+        print("  skipped fig9: reference_values.csv is missing (run main.py)")
+        return
+    best = None if oracle is None else approve_all - oracle      # the Oracle's net saving
+    s = inp.at()
+    models = [m for _, _, ms in GROUPS for m in ms if m in s.index]
+    saved = (approve_all - s.loc[models, "total_cost_mean"]).sort_values()   # largest on top
+
+    fig, ax = plt.subplots(figsize=(9, 0.4 * len(saved) + 1.9))
+    right = best or 0.0
+    for yi, (m, v) in enumerate(saved.items()):
+        r = s.loc[m]
+        ax.barh(yi, max(v, 0.0), height=0.62, color=color_of(m), edgecolor=SURFACE,
+                linewidth=0, hatch="////" if family_of(m) in HATCHED else None)
+        hi_end, below = max(v, 0.0), []                       # below = seeds under $0
+        if r["n_seeds"] > 1 and not np.isnan(r["total_cost_std"]):
+            sd = r["total_cost_std"]
+            sv = approve_all - inp.seeds(m, "total_cost")         # net saving of each seed
+            lo, hi = v - sd, v + sd
+            if hi > 0:                                            # error bar, cut at $0
+                ax.plot([max(lo, 0.0), hi], [yi, yi], color=INK, linewidth=0.9, zorder=3)
+                for end in (lo, hi):
+                    if end >= 0:                                  # a cap only on a real end
+                        ax.plot([end, end], [yi - 0.12, yi + 0.12], color=INK,
+                                linewidth=0.9, zorder=3)
+            ax.scatter(sv[sv >= 0], np.full((sv >= 0).sum(), yi), s=8, color=INK,
+                       alpha=0.6, zorder=3, linewidths=0)
+            below = sorted(sv[sv < 0])
+            hi_end = max(hi_end, hi, sv.max())
+        if v < 0 or below:                                        # something is cut off
+            ax.scatter(0, yi, marker="<", s=26, color=INK, zorder=5, clip_on=False)
+
+        share = f"  ({v / best:.0%} of the maximum)".replace("-", "−") if best else ""
+        note = "  — worse than no screening" if v < 0 else ""
+        if below:
+            n = len(below)
+            note += (f"\n◀ {n} seed{'s' if n > 1 else ''} below $0: "
+                     + ", ".join(money(x) for x in below))
+        ax.annotate(f"{money(v)}{share}{note}", (max(hi_end, 0.0), yi), xytext=(6, 0),
+                    textcoords="offset points", va="center", fontsize=7.5, zorder=4,
+                    linespacing=1.15, bbox=dict(facecolor=SURFACE, edgecolor="none", pad=0.6))
+        right = max(right, hi_end)
+
+    ax.axvline(0, color=INK, linewidth=0.9)
+    if best is not None:
+        ax.axvline(best, color=INK, linestyle=(0, (4, 2)), linewidth=1)
+        ax.text(best, 1.0, f"Oracle\n(maximum possible net saving)\n{money(best)}",
+                transform=ax.get_xaxis_transform(), ha="center", va="bottom", fontsize=7)
+    ax.set_yticks(range(len(saved)), [label_of(m) for m in saved.index])
+    ax.xaxis.set_major_formatter(money)
+    ax.set_xlim(0, right * 1.38)                              # $0 on the left; room for labels
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("Net Saving (higher is better)")
+    ax.set_title(f"Net saving of each model (C_a = ${inp.C_a:g})\n"
+                 "net saving = prevented fraud loss − investigation cost", loc="left",
+                 fontsize=9.5, pad=34)
+    save(fig, f"fig9_net_saving{suffix(inp.C_a)}")
+
+
+# =====================================================================
+# Figure 10: frauds caught at each C_a
+# =====================================================================
+def fig_frauds_caught(inp):
+    """Number of frauds each model blocks (TP, mean over seeds) at each C_a,
+    one panel per group. References: the Oracle (blocks only the frauds worth
+    more than C_a, so its line falls as C_a rises), Full-Info Online, and a
+    dashed line for all frauds in the test period."""
+    s = inp.summary
+    cas = sorted(s["C_a"].unique())
+    n_fraud = (int(inp.reference["n_fraud"].iloc[0])
+               if inp.reference is not None and "n_fraud" in inp.reference else None)
+    top = n_fraud if n_fraud else float(s["TP_mean"].max())
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10), sharey=True)
+    axes = axes.flatten()
+    for ax, (title, _, models) in zip(axes, GROUPS[:4]):
+        if n_fraud:
+            ax.axhline(n_fraud, color=INK_3, linestyle=(0, (4, 2)), linewidth=1)
+            ax.text(cas[0], n_fraud, f" all frauds in the test period ({n_fraud})",
+                    va="bottom", fontsize=7, color=INK_2)
+        drawn = {}
+        for m in ["Oracle", "FullInfoOnline"] + models:
+            g = s[s["model_id"] == m].set_index("C_a").reindex(cas)["TP_mean"]
+            if g.isna().all():
+                continue
+            ref = m in ("Oracle", "FullInfoOnline")
+            label = label_of(m) + ("  (catches only frauds worth more than C_a)"
+                                   if m == "Oracle" else "")
+            twin = next((d for d, gd in drawn.items()
+                         if (g - gd).abs().max() <= top * 0.02), None)
+            if twin is not None:                                  # hidden behind another line
+                label += f"  (on top of {label_of(twin, long=False)})"
+            drawn[m] = g
+            ax.plot(cas, g, color=color_of(m),
+                    linestyle=(0, (1, 1.5)) if m == "Oracle" else style_of(m), marker="o",
+                    markersize=4.5, markeredgecolor=SURFACE, linewidth=1.2 if ref else 1.7,
+                    label=label)
+        _ca_axis(ax, cas)
+        ax.set_ylim(0, top * 1.1)
+        ax.set_title(title, fontsize=9.5)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.2), fontsize=6.8)
+    for i in (0, 2):
+        axes[i].set_ylabel("Frauds Caught")
+    fig.suptitle("How many frauds each model catches as investigation gets more expensive", fontweight="bold", fontsize=10.5)
+    fig.tight_layout()
+    save(fig, "fig10_frauds_caught")
+
+# =====================================================================
+# Figure 10: frauds caught at each C_a (Bar chart)
+# =====================================================================
+def fig_frauds_caught_bar(inp):
+    """Number of frauds each model blocks (TP, mean over seeds) at each C_a,
+    as grouped bars, one panel per group. The Oracle's count at each C_a is
+    drawn as a black dotted marker across the group (it blocks only frauds
+    worth more than C_a, so it falls as C_a rises); the dashed line is all
+    frauds in the test period."""
+    summ = inp.summary
+    s = summ.set_index(["model_id", "C_a"])
+    cas = sorted(summ["C_a"].unique())
+    ids = set(summ["model_id"])
+    n_fraud = (int(inp.reference["n_fraud"].iloc[0])
+               if inp.reference is not None and "n_fraud" in inp.reference else None)
+    top = n_fraud if n_fraud else float(summ["TP_mean"].max())
+ 
+    def get(m, c, col):
+        return float(s[col].get((m, c), np.nan)) if col in s else np.nan
+ 
+    x = np.arange(len(cas))
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9.5), sharey=True)
+    for ax, (title, _, models) in zip(axes.flat, GROUPS[:4]):
+        present = [m for m in models if m in ids]
+        w = 0.8 / max(len(present), 1)
+        for j, m in enumerate(present):
+            xs = x - 0.4 + w * (j + 0.5)
+            vals = np.array([get(m, c, "TP_mean") for c in cas])
+            sds = np.array([get(m, c, "TP_std") for c in cas])
+            ax.bar(xs, vals, width=w * 0.9, color=color_of(m), edgecolor=SURFACE, linewidth=0,
+                   hatch="////" if family_of(m) in HATCHED else None, label=label_of(m))
+            ok = ~np.isnan(sds)
+            if ok.any():
+                ax.errorbar(xs[ok], vals[ok], yerr=sds[ok], fmt="none", ecolor=INK,
+                            elinewidth=0.8, capsize=2)
+            for xi, v, sd in zip(xs, vals, sds):
+                if not np.isnan(v):
+                    ax.text(xi, v + (0 if np.isnan(sd) else sd) + top * 0.01, f"{v:.0f}",
+                            ha="center", va="bottom", fontsize=6.3, color=INK_2)
+        if "Oracle" in ids:
+            for i, c in enumerate(cas):
+                v = get("Oracle", c, "TP_mean")
+                ax.hlines(v, x[i] - 0.45, x[i] + 0.45, color=INK, linewidth=1.6,
+                          linestyles=(0, (1, 1.2)), zorder=4,
+                          label="Oracle (catches only frauds worth more than C_a)"
+                          if i == 0 else None)
+        if n_fraud:
+            ax.axhline(n_fraud, color=INK_3, linestyle=(0, (4, 2)), linewidth=1)
+            ax.text(-0.45, n_fraud, f"all frauds in the test period ({n_fraud})",
+                    va="bottom", fontsize=7, color=INK_2)
+        ax.set_xticks(x, [f"${c:g}" for c in cas])
+        ax.set_xlim(-0.55, len(cas) - 0.45)
+        ax.set_ylim(0, top * 1.12)
+        ax.grid(axis="x", visible=False)
+        ax.set_xlabel("Investigation cost C_a")
+        ax.set_title(title, fontsize=9.5)
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=2, fontsize=6.8)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Frauds Caught")
+    fig.suptitle("How many frauds each model catches as investigation gets more expensive", fontweight="bold", fontsize=10.5)
+    fig.tight_layout()
+    save(fig, "fig10_frauds_caught_barchart")
+
+# =====================================================================
 # Command line
 # =====================================================================
 def main():
     ap = argparse.ArgumentParser(description="Draw the thesis figures from Results/.")
     ap.add_argument("--C_a", type=float, default=C_A,
-                    help=f"C_a for figures 1-4 and 6a (default {C_A:g})")
+                    help=f"C_a for figures 1-4, 6a and 9 (default {C_A:g})")
     args = ap.parse_args()
 
     if not (RESULTS_DIR / "results.csv").exists():
@@ -843,18 +1030,21 @@ def main():
     if inp.at().empty:
         raise SystemExit(f"No results at C_a = {args.C_a:g}.")
     print(f"Drawing figures into {GRAPHS_DIR}")
-    fig_standard_metrics(inp)
-    fig_decision_quality(inp)
-    fig_regret_all(inp)
-    fig_cost_breakdown(inp)
-    fig_ranking(inp)
-    fig_reward_gap(inp)
-    fig_family_gap(inp)
-    fig_csl_vs_csd(inp)
-    fig_extra_cost(inp)
-    fig_partial_vs_full(inp)
-    fig_blocked(inp)
-    fig_tuning()
+    # fig_standard_metrics(inp)
+    # fig_decision_quality(inp)
+    # fig_regret_all(inp)
+    # fig_cost_breakdown(inp)
+    # fig_ranking(inp)
+    # fig_reward_gap(inp)
+    # fig_family_gap(inp)
+    # fig_csl_vs_csd(inp)
+    # fig_extra_cost(inp)
+    # fig_partial_vs_full(inp)
+    # fig_blocked(inp)
+    # fig_tuning()
+    # fig_net_saving(inp)
+    # fig_frauds_caught(inp)
+    fig_frauds_caught_bar(inp)
 
 
 if __name__ == "__main__":
