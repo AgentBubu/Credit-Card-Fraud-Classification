@@ -10,6 +10,8 @@ Tables go to Results/tables/, figures to Graphs/:
   pairwise_tests.csv    each bandit vs each frozen supervised model: paired TFL difference and
                         Wilcoxon signed-rank p-value across seeds
   fig1_cumulative_tfl_<S>.png, fig2_loss_breakdown_<S>.png, fig3_weekly_fraud_loss_<S>.png
+  fig_all_scenarios_cumulative_tfl.png, fig_all_scenarios_loss_breakdown.png,
+  fig_all_scenarios_weekly_fraud_loss.png   every scenario in one figure each (always made)
 Total Financial Loss (TFL) = fraud let through + MFA cost + review cost, from true labels.
 """
 import argparse
@@ -214,11 +216,25 @@ def _style(ax):
     ax.tick_params(colors=INK2, labelsize=9, length=0)
 
 
-def _shift_lines(ax, scenario, ymax=None):
-    for s in SHIFTS.get(scenario, []):
-        ax.axvline(pd.Timestamp(s), color="#9a9993", linewidth=0.8)
-        ax.text(pd.Timestamp(s), 1.0, " shift", transform=ax.get_xaxis_transform(), color=INK2,
-                fontsize=8, va="top")
+# what enters the stream, and when (vertical lines on the figures)
+SHIFT_EVENTS = {
+    "S0": [],
+    "S1": [("2020-02-01", "B enters"), ("2020-07-01", "C replaces B")],
+    "S2": [("2020-02-01", "B ramps up"), ("2020-07-01", "B fades, C ramps up")],
+    "S3": [("2020-02-01", "A starts changing")],
+    "S4": [("2020-02-01", "B"), ("2020-04-01", "C"), ("2020-06-01", "B"), ("2020-08-01", "C"),
+           ("2020-10-01", "B"), ("2020-12-01", "C")],
+    "S5": [("2020-02-01", "adaptive fraudster starts")],
+}
+
+
+def _shift_lines(ax, scenario, fontsize=8):
+    """A vertical line where each change enters, labelled with what enters."""
+    for d, label in SHIFT_EVENTS.get(scenario, []):
+        t = pd.Timestamp(d)
+        ax.axvline(t, color="#9a9993", linewidth=0.8, zorder=0)
+        ax.text(t, 1.0, f" {label}", transform=ax.get_xaxis_transform(), color=INK2,
+                fontsize=fontsize, va="top", ha="left")
 
 
 def _end_labels(ax, ends, x):
@@ -263,7 +279,8 @@ def figure1(runs, scenario, outdir):
     _shift_lines(ax, scenario)
     _end_labels(ax, ends, mu.index[-1])
     best = min((e for e in ends if e[0] != "oracle"), key=lambda e: e[1])
-    ax.set_title(f"Cumulative Total Financial Loss in 2020, scenario {scenario}", loc="left", fontsize=11, color=INK)
+    ax.set_title(f"Cumulative Total Financial Loss in 2020, scenario {scenario}: "
+                 f"lowest is {LABEL[best[0]]} at ${best[1]:,.0f}k", loc="left", fontsize=11, color=INK)
     ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=9)
     ax.legend(frameon=False, fontsize=8, ncol=4, loc="upper left", bbox_to_anchor=(0, -0.08))
     n = max(len(v) for v in series.values())
@@ -340,6 +357,172 @@ def figure3(runs, scenario, outdir):
     plt.close(fig)
 
 
+def figure_all_scenarios(runs, outdir):
+    """One figure, one panel per scenario: cumulative Total Financial Loss per policy
+    (mean over seeds, band = range across seeds), with a line where each change enters."""
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    scen = [s for s in C.SCENARIOS if any(i["scenario"] == s for i, _ in runs)]
+    if not scen:
+        return
+    series = {}
+    for info, arr in runs:
+        p = info["policy"]
+        if p in COMPETITORS + ["oracle"]:
+            series.setdefault((info["scenario"], p), []).append(weekly(_frame(arr)).cumsum())
+    ncol = 3 if len(scen) > 2 else len(scen)
+    nrow = int(np.ceil(len(scen) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.9 * nrow + 1.0), dpi=200, squeeze=False)
+    handles = {}
+    seeds = 0
+    for ax, sc in zip(axes.flat, scen):
+        for p in COMPETITORS + ["oracle"]:
+            if (sc, p) not in series:
+                continue
+            M = pd.concat(series[(sc, p)], axis=1) / 1000
+            seeds = max(seeds, M.shape[1])
+            mu = M.mean(axis=1)
+            col = COLOR.get(p, "#9a9993")
+            (h,) = ax.plot(mu.index, mu.values, STYLE.get(p, "-"), color=col,
+                           linewidth=1.6 if p != "oracle" else 0.9, label=LABEL[p])
+            if M.shape[1] > 1:
+                ax.fill_between(mu.index, M.min(axis=1), M.max(axis=1), color=col, alpha=0.12, linewidth=0)
+            handles[p] = h
+        _style(ax)
+        _shift_lines(ax, sc, fontsize=6.5)
+        ax.set_title(f"{sc}: {SCENARIO_NAMES.get(sc, '')}", loc="left", fontsize=10, color=INK, pad=14)
+        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+        ax.set_ylim(bottom=0)
+    for ax in axes.flat[len(scen):]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=8.5)
+    order = [p for p in COMPETITORS + ["oracle"] if p in handles]
+    fig.legend([handles[p] for p in order], [LABEL[p] for p in order], loc="upper left",
+               bbox_to_anchor=(0.01, 0.965), ncol=min(len(order), 8), frameon=False, fontsize=8.5)
+    fig.suptitle("Cumulative Total Financial Loss in 2020, all scenarios", x=0.01, ha="left",
+                 fontsize=12, color=INK)
+    fig.text(0.01, 0.005, f"Mean over {seeds} seed(s); band = range across seeds. Vertical lines mark where each "
+             "change enters. Solid = bandits, dashed = frozen supervised models, grey = oracle. "
+             "Each panel has its own y-axis scale.", fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.935))
+    fig.savefig(os.path.join(outdir, "fig_all_scenarios_cumulative_tfl.png"))
+    plt.close(fig)
+
+
+BREAKDOWN = {"fraud_loss": "Fraud let through", "mfa_cost": "MFA challenges", "review_cost": "Reviews"}
+BREAKDOWN_COLORS = ["#184f95", "#5598e7", "#b7d3f6"]   # parts of one total: shades of one hue
+
+
+def figure_all_breakdown(m, outdir):
+    """One figure, one panel per scenario: each policy's 2020 loss split into fraud let through,
+    MFA cost and review cost (mean over seeds)."""
+    import matplotlib.pyplot as plt
+    scen = [s for s in C.SCENARIOS if s in set(m.scenario)]
+    if not scen:
+        return
+    ncol = 3 if len(scen) > 2 else len(scen)
+    nrow = int(np.ceil(len(scen) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.6 * ncol, 3.6 * nrow + 1.0), dpi=200, squeeze=False)
+    handles = None
+    seeds = int(m.groupby(["scenario", "policy"]).size().max())
+    for ax, sc in zip(axes.flat, scen):
+        ms = m[(m.scenario == sc) & m.policy.isin(COMPETITORS + ["oracle"])]
+        g = ms.groupby("policy")[list(BREAKDOWN)].mean() / 1000
+        g = g.loc[[p for p in COMPETITORS + ["oracle"] if p in g.index]]
+        g = g.iloc[np.argsort(g.sum(axis=1).values)[::-1]]
+        left = np.zeros(len(g))
+        hs = []
+        for k, col in zip(BREAKDOWN, BREAKDOWN_COLORS):
+            hs.append(ax.barh(range(len(g)), g[k], left=left, height=0.6, color=col, edgecolor="white",
+                              linewidth=1.5, label=BREAKDOWN[k]))
+            left += g[k].values
+        handles = handles or hs
+        for i, tot in enumerate(left):
+            ax.text(tot, i, f" ${tot:,.0f}k", va="center", fontsize=7, color=INK)
+        ax.set_yticks(range(len(g)), [LABEL[p] for p in g.index], fontsize=8, color=INK)
+        _style(ax)
+        ax.grid(axis="x", color=GRID, linewidth=0.8)
+        ax.grid(axis="y", visible=False)
+        ax.set_xlim(0, max(left.max(), 1) * 1.25)
+        ax.set_title(f"{sc}: {SCENARIO_NAMES.get(sc, '')}", loc="left", fontsize=10, color=INK)
+    for ax in axes.flat[len(scen):]:
+        ax.set_visible(False)
+    for ax in axes[-1, :]:
+        ax.set_xlabel("Loss in 2020 (US$ thousands)", color=INK2, fontsize=8.5)
+    fig.legend(handles, list(BREAKDOWN.values()), loc="upper left", bbox_to_anchor=(0.01, 0.955), ncol=3,
+               frameon=False, fontsize=8.5)
+    fig.suptitle("Where each policy's loss comes from, all scenarios", x=0.01, ha="left", fontsize=12, color=INK)
+    fig.text(0.01, 0.005, f"Mean over {seeds} seed(s). Approve-all is omitted (its loss is all fraud let through). "
+             "Each panel has its own x-axis scale.", fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.93))
+    fig.savefig(os.path.join(outdir, "fig_all_scenarios_loss_breakdown.png"))
+    plt.close(fig)
+
+
+def figure_all_weekly(runs, outdir):
+    """One figure: a row per scenario, a column per fraud pattern; weekly fraud let through per
+    policy (mean over seeds), with a line where each change enters."""
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    scen = [s for s in C.SCENARIOS if any(i["scenario"] == s for i, _ in runs)]
+    if not scen:
+        return
+    data = {}
+    for info, arr in runs:
+        if info["policy"] not in COMPETITORS:
+            continue
+        df = _frame(arr)
+        for k in PATTERNS:
+            if (df.pattern == k).any() or k == 0:
+                data.setdefault((info["scenario"], info["policy"], k), []).append(
+                    weekly(df[df.pattern == k], "fraud_loss"))
+    fig, axes = plt.subplots(len(scen), 3, figsize=(15, 2.3 * len(scen) + 1.0), dpi=200, squeeze=False,
+                             sharex=True)
+    handles = {}
+    for r, sc in enumerate(scen):
+        for c, k in enumerate(PATTERNS):
+            ax = axes[r, c]
+            present = [p for p in COMPETITORS if (sc, p, k) in data]
+            if not present:
+                ax.axis("off")
+                ax.text(0.5, 0.5, f"pattern {PATTERNS[k].split()[0]} does not occur in {sc}", ha="center",
+                        va="center", transform=ax.transAxes, fontsize=8, color=INK2)
+                continue
+            for p in present:
+                mu = pd.concat(data[(sc, p, k)], axis=1).mean(axis=1) / 1000
+                (h,) = ax.plot(mu.index, mu.values, STYLE[p], color=COLOR[p], linewidth=1.3, label=LABEL[p])
+                handles[p] = h
+            _style(ax)
+            _shift_lines(ax, sc, fontsize=6)
+            ax.set_ylim(bottom=0)
+            ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+            ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+            ax.tick_params(labelsize=7.5)
+            if c == 0:
+                ax.set_ylabel(f"{sc}: {SCENARIO_NAMES.get(sc, '')}\nUS$ k / week", color=INK, fontsize=8)
+        if r == 0:
+            for c, k in enumerate(PATTERNS):
+                axes[0, c].set_title(f"Pattern {PATTERNS[k]}", loc="left", fontsize=10, color=INK, pad=14)
+    order = [p for p in COMPETITORS if p in handles]
+    fig.legend([handles[p] for p in order], [LABEL[p] for p in order], loc="upper left",
+               bbox_to_anchor=(0.01, 0.975), ncol=len(order), frameon=False, fontsize=8.5)
+    fig.suptitle("Weekly fraud let through, by fraud pattern, all scenarios", x=0.01, ha="left", fontsize=12,
+                 color=INK, y=0.995)
+    seeds = max((len(v) for v in data.values()), default=0)
+    fig.text(0.01, 0.003, f"Mean over {seeds} seed(s). Vertical lines mark where each change enters. "
+             "Solid = bandits, dashed = frozen supervised models. Each panel has its own y-axis scale.",
+             fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.01, 1, 0.955))
+    fig.savefig(os.path.join(outdir, "fig_all_scenarios_weekly_fraud_loss.png"))
+    plt.close(fig)
+
+
+SCENARIO_NAMES = {"S0": "no drift", "S1": "sudden", "S2": "gradual", "S3": "incremental",
+                  "S4": "recurring", "S5": "adversarial"}
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=C.RESULTS_DIR)
@@ -366,9 +549,12 @@ def main(argv=None):
         f.write(markdown_table(t))
     pairwise_tests(m).to_csv(os.path.join(outdir, "pairwise_tests.csv"), index=False, encoding="utf-8-sig")
     for s in a.figure_scenario:
-        figure1(runs, s, a.graphs)
-        figure2(m, s, a.graphs)
+        #figure1(runs, s, a.graphs)
+        #figure2(m, s, a.graphs)
         figure3(runs, s, a.graphs)
+    figure_all_scenarios(runs, a.graphs)
+    figure_all_breakdown(m, a.graphs)
+    #figure_all_weekly(runs, a.graphs)
     print(t.to_string(index=False))
     print(f"\ntables written to {outdir}\nfigures written to {a.graphs}")
 
