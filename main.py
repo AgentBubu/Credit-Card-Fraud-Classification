@@ -1,346 +1,451 @@
+"""Metrics, the summary table and Figures 1-3, computed from the run logs.
+
+  python main.py analyze                      # everything found under Results/runs
+  python main.py analyze --figure-scenario S1 S5
+
+Tables go to Results/tables/, figures to Graphs/:
+  run_metrics.csv       one row per (scenario, seed, policy)
+  summary_table.csv/.md savings per policy and scenario (mean +/- 95% CI), recovery time,
+                        January 2020 loss (price of exploration)
+  pairwise_tests.csv    each bandit vs each frozen supervised model: paired TFL difference and
+                        Wilcoxon signed-rank p-value across seeds
+  fig1_cumulative_tfl_<S>.png, fig2_loss_breakdown_<S>.png, fig3_weekly_fraud_loss_<S>.png
+  fig_all_scenarios_cumulative_tfl.png   every scenario in one figure (always made)
+Total Financial Loss (TFL) = fraud let through + MFA cost + review cost, from true labels.
 """
-main.py  --  Step 2 of the study: the final runs on the test period.
-
-Run AFTER tuning.py. Every model runs with the setting tuning.py chose for
-it (Results/selected_settings.csv), at every investigation cost C_a in
-config.C_A_SWEEP_VALUES, and is scored on the SAME test period (the last
-30% of the stream), with the same dollar costs (Common/reward.py).
-
-  Bandits (6)       EpsilonGreedy, LinUCB, LinTS x {cost-sensitive, 0/1}
-                    ids CB_CS_<algorithm>, CB_LM_<algorithm>
-  Supervised (6)    LogisticRegression, RandomForest, XGBoost x {CSD, CSL},
-                    frozen after training on the first 70% (CSL: one model
-                    per C_a); ids SL_CSD_<model>, SL_CSL_<model>
-  Reference (3)     Oracle, Full-Info Online, Partial-Info Online
-                    (for Experiment 2, the cost of partial feedback)
-
-Random models run once per seed in config.SEEDS (5 seeds); deterministic
-ones (LogReg, XGBoost, the reference policies) run once, and their seed
-column is left blank. Bandits and online learners stream through all the
-data: the first 70% is their warm-up, and only the test period is scored.
-
-main.py RUNS the models; the scripts in Experiments/ only ANALYSE what it
-saved (ranking across C_a, the cost of partial feedback, the bootstrap
-tests), so all of them use exactly the same runs.
-
-Outputs
--------
-  Results/results.csv           one row per model x C_a x seed:
-        model (the model id), family, reward_type, seed, C_a, hyperparameters,
-        TP, TN, FP, FN, fraud_loss, investigation_cost, total_cost, regret, auprc
-  Results/summary.csv           mean and std over seeds per model x C_a
-                                (plus precision, recall, F1, false alarm rate)
-  Results/reference_values.csv  per C_a: Oracle cost, approve-all cost, ...
-  Results/decisions/<model_id>__Ca<C_a>.npz
-        every decision on the test period (one row per seed), for the regret
-        curves and the bootstrap tests; P(fraud)-style scores are kept at the
-        default C_a only (they are what the PR curves need)
-
-Usage
------
-  python main.py                        everything
-  python main.py --jobs 4               bandit / online streams on 4 cores
-  python main.py --models LinTS Oracle  only these (other models' rows kept)
-  python main.py --dry-run              list the work without running it
-  python main.py --no-cache             recompute instead of re-using cached runs
-
-Runs are cached (Results/cache), so an interrupted run resumes.
-"""
-
 import argparse
+import glob
 import json
-import time
-from dataclasses import dataclass, field
+import os
 
 import numpy as np
 import pandas as pd
 
-from Common import config
-from Common.config import (
-    BASE_SEED, C_A, C_A_SWEEP_VALUES, DECISIONS_DIR, REFERENCE_CSV, RESULT_COLUMNS,
-    RESULTS_CSV, SEEDS, SUMMARY_CSV,
-)
-from Common.metrics import (
-    DERIVED_COLUMNS, METRIC_COLUMNS, add_classification_metrics, evaluate_decisions,
-    rank_by_cost, reference_values, summarize_runs,
-)
-from Common.registry import all_ids, all_specs, get_spec
-from Common.runner import MODE_FINAL, get_decisions, hp_key, labels_and_amounts, worker_data
-from tuning import load_selected_settings, selected_hyperparameters
+from . import config as C
 
-SUMMARY_ID_COLUMNS = ["model", "family", "reward_type", "C_a", "hyperparameters"]
-
-
-# =====================================================================
-# The work list
-# =====================================================================
-@dataclass
-class FinalJob:
-    spec_id: str
-    hyperparameters: dict
-    seed: int
-    C_a_values: list = field(default_factory=list)
+COMPETITORS = C.BANDITS + C.SUPERVISED + C.SUPERVISED_EXTRA
+LABEL = {"eps_greedy": "ε-greedy", "linucb": "LinUCB", "lints": "LinTS",
+         "rf_frozen": "RF (frozen)", "xgb_frozen": "XGBoost (frozen)",
+         "rf_monthly": "RF (monthly)", "xgb_monthly": "XGBoost (monthly)",
+         "rf_quarterly": "RF (quarterly)", "xgb_quarterly": "XGBoost (quarterly)",
+         "oracle": "Oracle", "approve_all": "Approve all"}
+# categorical slots in fixed order (dataviz reference palette, light mode); colour follows the policy
+SLOT = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
+COLOR = {p: SLOT[i] for i, p in enumerate(C.BANDITS + C.SUPERVISED)}
+STYLE = {**{p: "-" for p in C.BANDITS}, "rf_frozen": "--", "xgb_frozen": "--",
+         "rf_monthly": ":", "xgb_monthly": ":", "rf_quarterly": "-.", "xgb_quarterly": "-."}
+INK, INK2, GRID = "#0b0b0b", "#52514e", "#e6e5e1"
+PATTERNS = {0: "A (original)", 1: "B (card testing)", 2: "C (low and slow)"}
+SHIFTS = {"S1": [C.DRIFT_START, C.SECOND_SHIFT], "S2": [C.DRIFT_START, C.SECOND_SHIFT],
+          "S3": [C.DRIFT_START], "S4": [C.DRIFT_START], "S5": [C.DRIFT_START], "S0": []}
 
 
-def seeds_for(spec):
-    return [BASE_SEED] if spec.deterministic else list(SEEDS)
+# ============================================================================= loading
+def load_runs(results_dir=None):
+    root = os.path.join(results_dir or C.RESULTS_DIR, "runs")
+    runs = []
+    for js in sorted(glob.glob(os.path.join(root, "*", "seed*", "*.json"))):
+        with open(js, encoding="utf-8") as f:
+            info = json.load(f)
+        z = np.load(js[:-5] + ".npz")
+        runs.append((info, {k: z[k] for k in z.files}))
+    return runs
 
 
-def settings_for(spec, C_a, selected):
-    """The tuned setting at this C_a ({} for the Oracle, which has none)."""
-    return {} if spec.grid is None else selected_hyperparameters(spec.id, C_a, selected)
+def _frame(arr):
+    df = pd.DataFrame({k: arr[k] for k in ("ts", "amt", "y", "pattern", "action", "bypass", "cost")})
+    df["ts"] = pd.to_datetime(df["ts"])
+    through = (df.y == 1) & ((df.action == C.APPROVE) | ((df.action == C.MFA) & (df.bypass == 1)))
+    df["fraud_loss"] = np.where(through, df.amt, 0.0)
+    df["mfa_cost"] = np.where(df.action == C.MFA, C.C_MFA, 0.0)
+    df["review_cost"] = np.where(df.action == C.REVIEW, C.C_REV, 0.0)
+    return df
 
 
-def make_jobs(specs, selected):
-    """One job per distinct run. A model whose learning ignores C_a and whose
-    tuned setting is the same at several C_a values runs ONCE for all of them
-    (its decisions are only re-scored per C_a)."""
-    jobs = {}
-    for spec in specs:
-        for C_a in C_A_SWEEP_VALUES:
-            hp = settings_for(spec, C_a, selected)
-            for seed in seeds_for(spec):
-                key = (spec.id, hp_key(hp), seed, C_a if spec.depends_on_C_a else None)
-                jobs.setdefault(key, FinalJob(spec.id, hp, seed)).C_a_values.append(C_a)
-    return list(jobs.values())
+# ============================================================================= metrics
+def weekly(df, col="cost"):
+    start = pd.Timestamp(C.TEST_START)
+    start = start - pd.Timedelta(days=start.weekday())          # the Monday on or before the start
+    idx = pd.date_range(start, C.TEST_END, freq="W-MON", inclusive="left")
+    s = df.set_index("ts")[col].resample("W-MON", label="left", closed="left").sum()
+    return s.reindex(idx, fill_value=0.0)
 
 
-def runs_in_parallel(job):
-    """Streams use one core each; supervised models (CSD and CSL) run in the
-    main process, one at a time (Random Forest already uses every core, and
-    several forests at once can run out of memory)."""
-    return not get_spec(job.spec_id).kind.startswith("supervised")
+def recovery_days(df, shift, tolerance=1.2):
+    """Days after a shift until the 2-week rolling weekly TFL is back within `tolerance` x
+    the mean weekly TFL of the 4 weeks before the shift. NaN = not recovered by year end."""
+    w = weekly(df)
+    t = pd.Timestamp(shift)
+    pre = w[(w.index < t) & (w.index >= t - pd.Timedelta(days=28))]
+    base = pre.mean() if len(pre) else np.nan
+    post = w[w.index >= t].rolling(2).mean().dropna()
+    if not np.isfinite(base):
+        return np.nan
+    ok = post[post <= tolerance * max(base, 1.0)]
+    if len(ok) == 0:
+        return np.nan
+    peak_seen = (w[w.index >= t] > tolerance * max(base, 1.0)).any()
+    return float((ok.index[0] - t).days) if peak_seen else 0.0
 
 
-# =====================================================================
-# One job: run once, score at each of its C_a values
-# =====================================================================
-def run_final_job(job, use_cache=True):
-    spec, data = get_spec(job.spec_id), worker_data()
-    labels, amounts = labels_and_amounts(data, MODE_FINAL)
-    out = []
-    for C_a in job.C_a_values:
-        actions, scores = get_decisions(spec, job.hyperparameters, data, job.seed, C_a,
-                                        MODE_FINAL, use_cache)
-        out.append({
-            "spec_id": spec.id, "C_a": float(C_a), "seed": job.seed,
-            "hyperparameters": job.hyperparameters,
-            "metrics": evaluate_decisions(actions, labels, amounts, C_a, scores),
-            "actions": actions.astype(np.int8),
-            "scores": None if (scores is None or C_a != C_A) else scores.astype(np.float32),
-        })
-    return out
+def detection_recovery_days(df, pattern, threshold=0.5, window_days=14, min_frauds=10):
+    """Days from a pattern's first appearance until the policy stops at least `threshold` of
+    that pattern's fraud transactions over a rolling `window_days` window (with at least
+    `min_frauds` in the window). NaN = never reached. A fairer recovery measure than a return
+    to each policy's own pre-shift loss, because policies start from different loss levels."""
+    f = df[(df.y == 1) & (df.pattern == pattern)].sort_values("ts")
+    if len(f) < min_frauds:
+        return np.nan
+    stopped = (f.action.isin([C.REVIEW, C.DECLINED]) | ((f.action == C.MFA) & (f.bypass == 0))).astype(float)
+    s = pd.Series(stopped.values, index=f.ts.values)
+    share = s.rolling(f"{window_days}D").mean()
+    count = s.rolling(f"{window_days}D").count()
+    ok = share[(share >= threshold) & (count >= min_frauds)]
+    t0 = f.ts.iloc[0]
+    return float((ok.index[0] - t0).days) if len(ok) else np.nan
 
 
-def run_all(jobs, n_jobs=1, use_cache=True):
-    serial = [j for j in jobs if n_jobs == 1 or not runs_in_parallel(j)]
-    parallel = [j for j in jobs if n_jobs != 1 and runs_in_parallel(j)]
-    total, done, results, t0 = len(jobs), 0, [], time.time()
-
-    def report(job, out):
-        nonlocal done
-        done += 1
-        first = out[0]
-        cas = ", ".join(f"{c:g}" for c in job.C_a_values)
-        print(f"[{done:>3}/{total}] {job.spec_id:<26} seed {job.seed}  C_a {cas:<14}"
-              f"  test cost at C_a={first['C_a']:g}: ${first['metrics']['total_cost']:>11,.2f}"
-              f"   [{time.time() - t0:,.0f}s]", flush=True)
-
-    for job in serial:
-        out = run_final_job(job, use_cache)
-        results += out
-        report(job, out)
-
-    if parallel:
-        from joblib import Parallel, delayed
-        print(f"\nRunning {len(parallel)} stream jobs on {n_jobs} processes ...", flush=True)
-        stream = Parallel(n_jobs=n_jobs, return_as="generator")(
-            delayed(run_final_job)(j, use_cache) for j in parallel)
-        for job, out in zip(parallel, stream):
-            results += out
-            report(job, out)
-    return results
-
-
-# =====================================================================
-# Saving
-# =====================================================================
-def results_table(results):
+def run_metrics(runs):
     rows = []
-    for r in results:
-        spec = get_spec(r["spec_id"])
-        rows.append({"model": spec.id, "family": spec.family,
-                     "reward_type": spec.reward_type or "",
-                     "seed": "" if spec.deterministic else r["seed"],   # blank: runs once
-                     "C_a": r["C_a"],
-                     "hyperparameters": json.dumps(r["hyperparameters"], sort_keys=True),
-                     "_model_id": spec.id, **r["metrics"]})
-    df = pd.DataFrame(rows)
-    order = {s.id: i for i, s in enumerate(all_specs())}
-    df["_o"] = df["_model_id"].map(order)
-    df["_s"] = pd.to_numeric(df["seed"], errors="coerce").fillna(-1)
-    df = df.sort_values(["_o", "C_a", "_s"]).reset_index(drop=True)
-    money = ["fraud_loss", "investigation_cost", "total_cost", "regret"]
-    df[money] = df[money].round(6)          # cents -> 6 decimals is lossless
-    return df
+    for info, arr in runs:
+        df = _frame(arr)
+        daily = arr["daily"]
+        n_legit = daily[:, 2].sum()
+        legit_challenged = ((df.y == 0) & df.action.isin([C.MFA, C.REVIEW])).sum()
+        fraud = df[df.y == 1]
+        stopped = fraud.action.isin([C.REVIEW, C.DECLINED]) | ((fraud.action == C.MFA) & (fraud.bypass == 0))
+        jan = df[df.ts < C.DRIFT_START]
+        r = dict(scenario=info["scenario"], seed=info["seed"], policy=info["policy"],
+                 tfl=df.cost.sum(), fraud_loss=df.fraud_loss.sum(), mfa_cost=df.mfa_cost.sum(),
+                 review_cost=df.review_cost.sum(), tfl_jan2020=jan.cost.sum(),
+                 reviews_per_day=(df.action == C.REVIEW).sum() / len(daily),
+                 mfa_per_day=(df.action == C.MFA).sum() / len(daily),
+                 friction_rate=legit_challenged / max(n_legit, 1),
+                 fraud_stopped=stopped.mean() if len(fraud) else np.nan, seconds=info.get("seconds"))
+        for k, name in PATTERNS.items():
+            fp = fraud[fraud.pattern == k]
+            r[f"fraud_loss_{name[0]}"] = fp.fraud_loss.sum()
+            r[f"stopped_{name[0]}"] = stopped[fraud.pattern == k].mean() if len(fp) else np.nan
+        for k in (1, 2):
+            r[f"detect_recovery_{'BC'[k - 1]}_days"] = detection_recovery_days(df, k)
+            fk = fraud[fraud.pattern == k]
+            if len(fk):
+                first = fk[fk.ts < fk.ts.min() + pd.Timedelta(days=60)]
+                r[f"stopped_{'BC'[k - 1]}_first60d"] = stopped[first.index].mean()
+        for j, s in enumerate(SHIFTS.get(info["scenario"], [])):
+            t = pd.Timestamp(s)
+            r[f"post_shift{j + 1}_loss"] = df[(df.ts >= t) & (df.ts < t + pd.Timedelta(days=60))].cost.sum()
+            r[f"recovery{j + 1}_days"] = recovery_days(df, s)
+        rows.append(r)
+    m = pd.DataFrame(rows)
+    base = m[m.policy == "approve_all"].set_index(["scenario", "seed"]).tfl
+    m["savings"] = [1 - t / base.get((s, k), np.nan) for s, k, t in zip(m.scenario, m.seed, m.tfl)]
+    return m
 
 
-def model_id_of(row):
-    """The model column holds the model id, e.g. 'CB_CS_LinTS', 'SL_CSL_XGBoost'."""
-    return row["model"]
+def _ci(x):
+    x = np.asarray(x, float)
+    x = x[np.isfinite(x)]
+    if len(x) == 0:
+        return np.nan, np.nan
+    if len(x) == 1:
+        return x[0], np.nan
+    from scipy import stats
+    return x.mean(), stats.t.ppf(0.975, len(x) - 1) * x.std(ddof=1) / np.sqrt(len(x))
 
 
-def decisions_path(model_id, C_a):
-    return DECISIONS_DIR / f"{model_id}__Ca{float(C_a):g}.npz"
+def summary_table(m):
+    out = []
+    for p in [x for x in C.POLICIES + C.SUPERVISED_EXTRA if x in set(m.policy)]:
+        row = {"policy": LABEL[p]}
+        for s in [x for x in C.SCENARIOS if x in set(m.scenario)]:
+            mu, h = _ci(m[(m.policy == p) & (m.scenario == s)].savings)
+            row[f"{s} savings"] = f"{100 * mu:.1f}%" + ("" if not np.isfinite(h) else f" ± {100 * h:.1f}")
+        mu, h = _ci(m[m.policy == p].tfl_jan2020)
+        row["Jan 2020 loss ($)"] = f"{mu:,.0f}" + ("" if not np.isfinite(h) else f" ± {h:,.0f}")
+        for k in "BC":
+            col = f"stopped_{k}_first60d"
+            v = m[(m.policy == p) & (m.scenario == "S1")][col] if col in m else []
+            if len(v):
+                mu, h = _ci(v)
+                row[f"S1 pattern {k} stopped, first 60 days"] = f"{100 * mu:.0f}%" + (
+                    "" if not np.isfinite(h) else f" \u00b1 {100 * h:.0f}")
+        out.append(row)
+    return pd.DataFrame(out)
 
 
-def save_decisions(results):
-    """One file per model x C_a: actions[seed, transaction] (+ scores at C_A)."""
-    config.ensure_directories()
-    groups = {}
-    for r in results:
-        groups.setdefault((r["spec_id"], r["C_a"]), []).append(r)
-    for (model_id, C_a), runs in groups.items():
-        runs = sorted(runs, key=lambda r: r["seed"])
-        payload = {"seeds": np.array([r["seed"] for r in runs]),
-                   "actions": np.stack([r["actions"] for r in runs]),
-                   "hyperparameters": np.array(json.dumps(runs[0]["hyperparameters"],
-                                                          sort_keys=True)),
-                   "deterministic": np.array(get_spec(model_id).deterministic)}
-        if all(r["scores"] is not None for r in runs):
-            payload["scores"] = np.stack([r["scores"] for r in runs])
-        path = decisions_path(model_id, C_a)
-        tmp = path.with_suffix(".tmp.npz")
-        np.savez_compressed(tmp, **payload)
-        tmp.replace(path)
+def markdown_table(df):
+    """A GitHub-style Markdown table (no extra packages needed)."""
+    cols = [str(c) for c in df.columns]
+    rows = [[("" if pd.isna(v) else str(v)) for v in r] for r in df.itertuples(index=False)]
+    lines = ["| " + " | ".join(cols) + " |", "| " + " | ".join("---" for _ in cols) + " |"]
+    lines += ["| " + " | ".join(r) + " |" for r in rows]
+    return "\n".join(lines) + "\n"
 
 
-def load_decisions(model_id, C_a):
-    """For the experiments: {'seeds', 'actions' (n_seeds x n_test), 'scores'
-    (or None), 'hyperparameters' (dict), 'deterministic'} for one model x C_a.
-    The matching labels and amounts are labels_and_amounts(data, 'final')."""
-    path = decisions_path(model_id, C_a)
-    if not path.exists():
-        raise FileNotFoundError(f"{path.name} not found: run `python main.py` first.")
-    with np.load(path, allow_pickle=False) as f:
-        return {"seeds": f["seeds"], "actions": f["actions"],
-                "scores": f["scores"] if "scores" in f else None,
-                "hyperparameters": json.loads(str(f["hyperparameters"])),
-                "deterministic": bool(f["deterministic"])}
+def pairwise_tests(m):
+    from scipy import stats
+    rows = []
+    for s in sorted(set(m.scenario)):
+        ms = m[m.scenario == s].pivot_table(index="seed", columns="policy", values="tfl")
+        for b in C.BANDITS:
+            for sp in C.SUPERVISED + C.SUPERVISED_EXTRA:
+                if b not in ms or sp not in ms:
+                    continue
+                d = (ms[b] - ms[sp]).dropna()
+                mu, h = _ci(d)
+                p = np.nan
+                if len(d) >= 5 and (d != 0).any():
+                    p = stats.wilcoxon(d).pvalue
+                rows.append(dict(scenario=s, bandit=LABEL[b], supervised=LABEL[sp], n_seeds=len(d),
+                                 mean_tfl_difference=mu, ci95=h, wilcoxon_p=p,
+                                 verdict=("bandit lower loss" if p < 0.05 and mu < 0 else
+                                          "bandit higher loss" if p < 0.05 and mu > 0 else
+                                          "no significant difference" if np.isfinite(p) else "too few seeds")))
+    return pd.DataFrame(rows)
 
 
-def load_results(path=RESULTS_CSV):
-    """results.csv with a model_id column added (e.g. 'CB_CS_LinTS')."""
-    df = pd.read_csv(path, keep_default_na=False, na_values=[""])
-    df["reward_type"] = df["reward_type"].fillna("")
-    df["seed"] = df["seed"].astype("Int64")          # whole numbers; blank = deterministic
-    df.insert(0, "model_id", df.apply(model_id_of, axis=1))
-    return df
+# ============================================================================= figures
+def _style(ax):
+    ax.grid(axis="y", color=GRID, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_color("#bdbcb6")
+    ax.tick_params(colors=INK2, labelsize=9, length=0)
 
 
-def summary_table(results_df):
-    df = add_classification_metrics(results_df)
-    df["reward_type"] = df["reward_type"].fillna("")
-    s = summarize_runs(df, SUMMARY_ID_COLUMNS, METRIC_COLUMNS + DERIVED_COLUMNS)
-    s.insert(0, "model_id", s.apply(model_id_of, axis=1))
-    return s
+# what enters the stream, and when (vertical lines on the figures)
+SHIFT_EVENTS = {
+    "S0": [],
+    "S1": [("2020-02-01", "B enters"), ("2020-07-01", "C replaces B")],
+    "S2": [("2020-02-01", "B ramps up"), ("2020-07-01", "B fades, C ramps up")],
+    "S3": [("2020-02-01", "A starts changing")],
+    "S4": [("2020-02-01", "B"), ("2020-04-01", "C"), ("2020-06-01", "B"), ("2020-08-01", "C"),
+           ("2020-10-01", "B"), ("2020-12-01", "C")],
+    "S5": [("2020-02-01", "adaptive fraudster starts")],
+}
 
 
-def reference_table(data):
-    labels, amounts = labels_and_amounts(data, MODE_FINAL)
-    df = pd.DataFrame([reference_values(labels, amounts, c) for c in C_A_SWEEP_VALUES])
-    return df.round({"oracle_cost": 6, "approve_all_cost": 6})
+def _shift_lines(ax, scenario, fontsize=8):
+    """A vertical line where each change enters, labelled with what enters."""
+    for d, label in SHIFT_EVENTS.get(scenario, []):
+        t = pd.Timestamp(d)
+        ax.axvline(t, color="#9a9993", linewidth=0.8, zorder=0)
+        ax.text(t, 1.0, f" {label}", transform=ax.get_xaxis_transform(), color=INK2,
+                fontsize=fontsize, va="top", ha="left")
 
 
-# =====================================================================
-# Console report
-# =====================================================================
-def print_report(summary):
-    at = summary[summary["C_a"] == C_A].sort_values("total_cost_mean")
-    view = at[["model_id", "family", "n_seeds", "total_cost_mean", "total_cost_std",
-               "regret_mean", "recall_mean", "precision_mean", "auprc_mean"]]
-    print(f"\n=== Test period at C_a = ${C_A:g}, lowest total cost first ===")
-    with pd.option_context("display.width", 200, "display.max_columns", 20,
-                           "display.float_format", "{:,.3f}".format):
-        print(view.to_string(index=False))
-        main_models = summary[summary["model_id"] != "Oracle"]
-        print("\n=== Rank by mean total cost at each C_a (1 = lowest) ===")
-        print(rank_by_cost(main_models, model_col="model_id").to_string())
-
-
-# =====================================================================
-# Command line
-# =====================================================================
-def pick_specs(names):
-    specs = all_specs()
-    if not names:
-        return specs
-    chosen = [s for s in specs if s.id in names or s.name in names]
-    unknown = set(names) - {s.id for s in chosen} - {s.name for s in chosen}
-    if unknown:
-        raise SystemExit(f"unknown model(s): {sorted(unknown)}. "
-                         f"Choose from {[s.id for s in specs]} or their names.")
-    return chosen
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Final runs on the test period.")
-    ap.add_argument("--models", nargs="*", help="model names or ids (default: all)")
-    ap.add_argument("--jobs", type=int, default=1, help="processes for streams (-1 = all)")
-    ap.add_argument("--no-cache", action="store_true", help="recompute every run")
-    ap.add_argument("--dry-run", action="store_true", help="list the work, run nothing")
-    args = ap.parse_args()
-
-    config.validate_config()
-    config.ensure_directories()
-    specs = pick_specs(args.models)
-    selected = load_selected_settings()
-    untuned = sorted({s.id for s in specs for c in C_A_SWEEP_VALUES
-                      if s.grid is not None and (s.id, float(c)) not in selected})
-    if untuned:
-        raise SystemExit(f"No tuned settings for {untuned}: run "
-                         f"`python tuning.py --models {' '.join(untuned)}` first.")
-    jobs = make_jobs(specs, selected)
-
-    data = worker_data()
-    print("=== main.py: final runs on the test period ===")
-    print(data.summary())
-    print(f"C_a values: {C_A_SWEEP_VALUES} | seeds: {list(SEEDS)} | settings: tuning.py\n")
-    for s in specs:
-        print(f"  {s.id:<26} {sum(j.spec_id == s.id for j in jobs):>3} runs")
-    print(f"  total: {len(jobs)} runs\n")
-    if args.dry_run:
+def _end_labels(ax, ends, x):
+    """Direct labels at line ends; nudged apart with thin leaders when they collide."""
+    if not ends:
         return
+    lo, hi = ax.get_ylim()
+    gap = (hi - lo) * 0.045
+    ends = sorted(ends, key=lambda e: e[1])
+    ys = [e[1] for e in ends]
+    for i in range(1, len(ys)):
+        ys[i] = max(ys[i], ys[i - 1] + gap)
+    for (p, y0, txt), y in zip(ends, ys):
+        ax.annotate(txt, xy=(x, y0), xytext=(x + pd.Timedelta(days=8), y), fontsize=8.5, color=INK,
+                    va="center", annotation_clip=False,
+                    arrowprops=dict(arrowstyle="-", color=COLOR.get(p, INK2), linewidth=0.8))
 
-    t0 = time.time()
-    results = run_all(jobs, n_jobs=args.jobs, use_cache=not args.no_cache)
-    save_decisions(results)
 
-    new = results_table(results)
-    if args.models and RESULTS_CSV.exists():          # keep the other models' rows
-        old = load_results()
-        known = set(all_ids())
-        stale = sorted(set(old["model_id"]) - known)
-        if stale:
-            print(f"Dropped rows of models that no longer exist (old names): {stale}")
-        old = old[old["model_id"].isin(known) & ~old["model_id"].isin(new["_model_id"].unique())]
-        old = old.rename(columns={"model_id": "_model_id"})
-        new = pd.concat([old, new], ignore_index=True)
-        order = {s.id: i for i, s in enumerate(all_specs())}
-        new["_o"] = new["_model_id"].map(order)
-        new["_s"] = pd.to_numeric(new["seed"], errors="coerce").fillna(-1)
-        new = new.sort_values(["_o", "C_a", "_s"]).reset_index(drop=True)
-    final = new[RESULT_COLUMNS]
-    final.to_csv(RESULTS_CSV, index=False)
+def figure1(runs, scenario, outdir):
+    import matplotlib.pyplot as plt
+    series = {}
+    for info, arr in runs:
+        if info["scenario"] != scenario or info["policy"] not in COMPETITORS + ["oracle"]:
+            continue
+        series.setdefault(info["policy"], []).append(weekly(_frame(arr)).cumsum())
+    if not series:
+        return
+    fig, ax = plt.subplots(figsize=(9, 5.2), dpi=200)
+    ends = []
+    for p in COMPETITORS + ["oracle"]:
+        if p not in series:
+            continue
+        M = pd.concat(series[p], axis=1) / 1000
+        mu = M.mean(axis=1)
+        col = COLOR.get(p, "#9a9993")
+        ax.plot(mu.index, mu.values, STYLE.get(p, "-"), color=col, linewidth=1.8 if p != "oracle" else 1.0,
+                label=LABEL[p], solid_capstyle="round")
+        if M.shape[1] > 1:
+            ax.fill_between(mu.index, M.min(axis=1), M.max(axis=1), color=col, alpha=0.12, linewidth=0)
+        ends.append((p, mu.iloc[-1], f"{LABEL[p]}  ${mu.iloc[-1]:,.0f}k"))
+    _style(ax)
+    _shift_lines(ax, scenario)
+    _end_labels(ax, ends, mu.index[-1])
+    best = min((e for e in ends if e[0] != "oracle"), key=lambda e: e[1])
+    ax.set_title(f"Cumulative Total Financial Loss in 2020, scenario {scenario}: "
+                 f"lowest is {LABEL[best[0]]} at ${best[1]:,.0f}k", loc="left", fontsize=11, color=INK)
+    ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=9)
+    ax.legend(frameon=False, fontsize=8, ncol=4, loc="upper left", bbox_to_anchor=(0, -0.08))
+    n = max(len(v) for v in series.values())
+    fig.text(0.01, 0.005, f"Mean over {n} seed(s); band = range across seeds. Lines: solid = bandits, "
+             "dashed = frozen supervised models.", fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.03, 0.86, 1))
+    fig.savefig(os.path.join(outdir, f"fig1_cumulative_tfl_{scenario}.png"))
+    plt.close(fig)
 
-    summary = summary_table(load_results().drop(columns="model_id"))
-    summary.to_csv(SUMMARY_CSV, index=False)
-    reference_table(data).to_csv(REFERENCE_CSV, index=False)
 
-    print_report(summary)
-    print(f"\nSaved {RESULTS_CSV}\n      {SUMMARY_CSV}\n      {REFERENCE_CSV}\n"
-          f"      {DECISIONS_DIR}{'/'}*.npz")
-    print(f"Total time: {(time.time() - t0) / 60:.1f} min")
+def figure2(m, scenario, outdir):
+    import matplotlib.pyplot as plt
+    ms = m[(m.scenario == scenario) & m.policy.isin(COMPETITORS + ["oracle"])]
+    if ms.empty:
+        return
+    g = ms.groupby("policy")[["fraud_loss", "mfa_cost", "review_cost"]].mean() / 1000
+    g = g.loc[[p for p in COMPETITORS + ["oracle"] if p in g.index]]
+    g = g.iloc[np.argsort(g.sum(axis=1).values)[::-1]]
+    fig, ax = plt.subplots(figsize=(9, 4.6), dpi=200)
+    left = np.zeros(len(g))
+    names = {"fraud_loss": "Fraud let through", "mfa_cost": "MFA challenges", "review_cost": "Reviews"}
+    # parts of one total: shades of a single hue, so they are not confused with policy colours
+    for k, col in zip(names, ["#184f95", "#5598e7", "#b7d3f6"]):
+        ax.barh(range(len(g)), g[k], left=left, height=0.55, color=col, edgecolor="white", linewidth=2,
+                label=names[k])
+        left += g[k].values
+    for i, tot in enumerate(left):
+        ax.text(tot, i, f"  ${tot:,.0f}k", va="center", fontsize=8.5, color=INK)
+    ax.set_yticks(range(len(g)), [LABEL[p] for p in g.index], fontsize=9, color=INK)
+    _style(ax)
+    ax.grid(axis="x", color=GRID, linewidth=0.8)
+    ax.grid(axis="y", visible=False)
+    ax.set_xlabel("Total Financial Loss in 2020 (US$ thousands, mean over seeds)", color=INK2, fontsize=9)
+    top = g.sum(axis=1).idxmin() if "oracle" not in g.index else g.drop("oracle").sum(axis=1).idxmin()
+    ax.set_title(f"Where each policy's loss comes from, scenario {scenario}: {LABEL[top]} loses least",
+                 loc="left", fontsize=11, color=INK, pad=26)
+    ax.legend(frameon=False, fontsize=8.5, ncol=3, loc="lower left", bbox_to_anchor=(0, 1.0))
+    ax.set_xlim(0, left.max() * 1.15)
+    fig.text(0.01, 0.01, "Approve-all is omitted (its loss is all fraud let through).", fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.03, 1, 1))
+    fig.savefig(os.path.join(outdir, f"fig2_loss_breakdown_{scenario}.png"))
+    plt.close(fig)
+
+
+def figure3(runs, scenario, outdir):
+    import matplotlib.pyplot as plt
+    data = {}
+    for info, arr in runs:
+        if info["scenario"] != scenario or info["policy"] not in COMPETITORS:
+            continue
+        df = _frame(arr)
+        for k in PATTERNS:
+            data.setdefault((info["policy"], k), []).append(weekly(df[df.pattern == k], "fraud_loss"))
+    present = sorted({k for _, k in data})
+    if not present:
+        return
+    fig, axes = plt.subplots(len(present), 1, figsize=(9, 2.6 * len(present) + 0.6), dpi=200, sharex=True)
+    axes = np.atleast_1d(axes)
+    for ax, k in zip(axes, present):
+        for p in COMPETITORS:
+            if (p, k) not in data:
+                continue
+            mu = pd.concat(data[(p, k)], axis=1).mean(axis=1) / 1000
+            ax.plot(mu.index, mu.values, STYLE[p], color=COLOR[p], linewidth=1.6, label=LABEL[p])
+        _style(ax)
+        _shift_lines(ax, scenario)
+        ax.set_title(f"Pattern {PATTERNS[k]}", loc="left", fontsize=9.5, color=INK)
+        ax.set_ylabel("US$ thousands / week", color=INK2, fontsize=8.5)
+    axes[0].legend(frameon=False, fontsize=8, ncol=4, loc="upper left", bbox_to_anchor=(0, 1.32))
+    fig.suptitle(f"Weekly fraud let through, by fraud pattern, scenario {scenario}", x=0.01, ha="left",
+                 fontsize=11, color=INK)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(os.path.join(outdir, f"fig3_weekly_fraud_loss_{scenario}.png"))
+    plt.close(fig)
+
+
+def figure_all_scenarios(runs, outdir):
+    """One figure, one panel per scenario: cumulative Total Financial Loss per policy
+    (mean over seeds, band = range across seeds), with a line where each change enters."""
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    scen = [s for s in C.SCENARIOS if any(i["scenario"] == s for i, _ in runs)]
+    if not scen:
+        return
+    series = {}
+    for info, arr in runs:
+        p = info["policy"]
+        if p in COMPETITORS + ["oracle"]:
+            series.setdefault((info["scenario"], p), []).append(weekly(_frame(arr)).cumsum())
+    ncol = 3 if len(scen) > 2 else len(scen)
+    nrow = int(np.ceil(len(scen) / ncol))
+    fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.9 * nrow + 1.0), dpi=200, squeeze=False)
+    handles = {}
+    seeds = 0
+    for ax, sc in zip(axes.flat, scen):
+        for p in COMPETITORS + ["oracle"]:
+            if (sc, p) not in series:
+                continue
+            M = pd.concat(series[(sc, p)], axis=1) / 1000
+            seeds = max(seeds, M.shape[1])
+            mu = M.mean(axis=1)
+            col = COLOR.get(p, "#9a9993")
+            (h,) = ax.plot(mu.index, mu.values, STYLE.get(p, "-"), color=col,
+                           linewidth=1.6 if p != "oracle" else 0.9, label=LABEL[p])
+            if M.shape[1] > 1:
+                ax.fill_between(mu.index, M.min(axis=1), M.max(axis=1), color=col, alpha=0.12, linewidth=0)
+            handles[p] = h
+        _style(ax)
+        _shift_lines(ax, sc, fontsize=6.5)
+        ax.set_title(f"{sc}: {SCENARIO_NAMES.get(sc, '')}", loc="left", fontsize=10, color=INK, pad=14)
+        ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+        ax.set_ylim(bottom=0)
+    for ax in axes.flat[len(scen):]:
+        ax.set_visible(False)
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=8.5)
+    order = [p for p in COMPETITORS + ["oracle"] if p in handles]
+    fig.legend([handles[p] for p in order], [LABEL[p] for p in order], loc="upper left",
+               bbox_to_anchor=(0.01, 0.965), ncol=min(len(order), 8), frameon=False, fontsize=8.5)
+    fig.suptitle("Cumulative Total Financial Loss in 2020, all scenarios", x=0.01, ha="left",
+                 fontsize=12, color=INK)
+    fig.text(0.01, 0.005, f"Mean over {seeds} seed(s); band = range across seeds. Vertical lines mark where each "
+             "change enters. Solid = bandits, dashed = frozen supervised models, grey = oracle. "
+             "Each panel has its own y-axis scale.", fontsize=7.5, color=INK2)
+    fig.tight_layout(rect=(0, 0.02, 1, 0.935))
+    fig.savefig(os.path.join(outdir, "fig_all_scenarios_cumulative_tfl.png"))
+    plt.close(fig)
+
+
+SCENARIO_NAMES = {"S0": "no drift", "S1": "sudden", "S2": "gradual", "S3": "incremental",
+                  "S4": "recurring", "S5": "adversarial"}
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--results", default=C.RESULTS_DIR)
+    ap.add_argument("--graphs", default=C.GRAPHS_DIR)
+    ap.add_argument("--figure-scenario", nargs="+", default=["S1"])
+    a = ap.parse_args(argv)
+    bad = [x for x in a.figure_scenario if x not in C.SCENARIOS]
+    if bad:
+        raise SystemExit(f"unknown scenario(s) {bad} for --figure-scenario; choose from {C.SCENARIOS}")
+    runs = load_runs(a.results)
+    if not runs:
+        raise SystemExit(f"no runs found in {os.path.join(a.results, 'runs')}; run 'python main.py run' first")
+    missing = [x for x in a.figure_scenario if x not in {i["scenario"] for i, _ in runs}]
+    if missing:
+        print(f"note: no runs yet for {missing}; their figures are skipped")
+    outdir = os.path.join(a.results, "tables")
+    os.makedirs(outdir, exist_ok=True)
+    os.makedirs(a.graphs, exist_ok=True)
+    m = run_metrics(runs)
+    m.to_csv(os.path.join(outdir, "run_metrics.csv"), index=False, encoding="utf-8-sig")
+    t = summary_table(m)
+    t.to_csv(os.path.join(outdir, "summary_table.csv"), index=False, encoding="utf-8-sig")
+    with open(os.path.join(outdir, "summary_table.md"), "w", encoding="utf-8") as f:
+        f.write(markdown_table(t))
+    pairwise_tests(m).to_csv(os.path.join(outdir, "pairwise_tests.csv"), index=False, encoding="utf-8-sig")
+    for s in a.figure_scenario:
+        figure1(runs, s, a.graphs)
+        figure2(m, s, a.graphs)
+        figure3(runs, s, a.graphs)
+    figure_all_scenarios(runs, a.graphs)
+    print(t.to_string(index=False))
+    print(f"\ntables written to {outdir}\nfigures written to {a.graphs}")
 
 
 if __name__ == "__main__":
