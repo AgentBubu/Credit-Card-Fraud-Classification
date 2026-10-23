@@ -191,6 +191,9 @@ def generate(df_orig, scenario, seed=0, force_pattern=None):
     groups = fraud.groupby("burst_id").groups
     starts = fraud.groupby("burst_id").ts.min().sort_values()
     cols = ["ts", "amt", "category", "merchant", "merch_lat", "merch_long"]
+    # Collect the rewrites and write them back once: a per-burst df.loc into a 1.85M-row frame
+    # cost 19x more than the rewrite itself, and the rng call order below is unchanged.
+    parts, pats, phases, lens = [], [], [], []
     for bid, t0 in starts.items():
         if force_pattern is not None:
             pat, phase = (force_pattern if t0 >= DRIFT_START else "A"), "S5"
@@ -200,9 +203,14 @@ def generate(df_orig, scenario, seed=0, force_pattern=None):
         rows = df.loc[groups[bid]].sort_values("ts")
         morph = morph_progress(t0) if scenario == "S3" else 0.0
         new = rw.rewrite(rows, pat, morph)
-        df.loc[new.index, cols] = new[cols].values
-        df.loc[new.index, "fraud_pattern"] = pat
-        df.loc[new.index, "drift_phase"] = phase
+        parts.append(new[cols])
+        pats.append(pat)
+        phases.append(phase)
+        lens.append(len(new))
+    upd = pd.concat(parts)
+    df.loc[upd.index, cols] = upd[cols].values
+    df.loc[upd.index, "fraud_pattern"] = np.repeat(np.asarray(pats, dtype=object), lens)
+    df.loc[upd.index, "drift_phase"] = np.repeat(np.asarray(phases, dtype=object), lens)
     # phase label for every row, by transaction date
     day = df["ts"].dt.normalize()
     if force_pattern is None:
