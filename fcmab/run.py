@@ -65,7 +65,7 @@ def main(argv=None):
     jobs = [(s, k, p, a.params) for s in scenarios for k in seeds for p in policies
             if a.rerun or not os.path.exists(run_path(s, k, p) + ".json")]
     # slowest jobs first, so the cores stay busy at the end
-    jobs.sort(key=lambda j: (j[2] not in C.BANDITS, j[2] not in C.SUPERVISED))
+    jobs.sort(key=lambda j: (j[2] not in C.RETRAINED, j[2] not in C.BANDITS, j[2] not in C.SUPERVISED))
     print(f"{len(jobs)} runs to do on {a.jobs} processes")
     t = time.time()
     if a.jobs == 1:

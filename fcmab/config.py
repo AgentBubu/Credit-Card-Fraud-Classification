@@ -31,7 +31,9 @@ SCENARIOS = ["S0", "S1", "S2", "S3", "S4", "S5"]
 SEEDS = list(range(10))
 BANDITS = ["eps_greedy", "linucb", "lints"]
 SUPERVISED = ["rf_frozen", "xgb_frozen"]        # trained on 2019, never retrained
-SUPERVISED_EXTRA = []                            # retrained variants are not part of the study
+# retrained every month on the labels received so far; reported separately (python main.py analyze-retrain)
+RETRAINED = ["rf_monthly", "xgb_monthly"]
+SUPERVISED_EXTRA = []
 REFERENCES = ["approve_all", "oracle"]          # not competitors: savings baseline and lower bound
 POLICIES = REFERENCES + BANDITS + SUPERVISED
 

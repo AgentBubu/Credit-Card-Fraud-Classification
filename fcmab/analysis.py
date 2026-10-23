@@ -10,7 +10,8 @@ Tables go to Results/tables/, figures to Graphs/:
   pairwise_tests.csv    each bandit vs each frozen supervised model: paired TFL difference and
                         Wilcoxon signed-rank p-value across seeds
   fig1_cumulative_tfl_<S>.png, fig2_loss_breakdown_<S>.png, fig3_weekly_fraud_loss_<S>.png
-  fig_all_scenarios_cumulative_tfl.png, fig_all_scenarios_loss_breakdown.png,
+  fig_all_scenarios_cumulative_tfl.png, fig_all_scenarios_cumulative_fraud_let_through.png,
+  fig_all_scenarios_loss_breakdown.png,
   fig_all_scenarios_weekly_fraud_loss.png   every scenario in one figure each (always made)
 Total Financial Loss (TFL) = fraud let through + MFA cost + review cost, from true labels.
 """
@@ -24,7 +25,8 @@ import pandas as pd
 
 from . import config as C
 
-COMPETITORS = C.BANDITS + C.SUPERVISED + C.SUPERVISED_EXTRA
+COMPETITORS = C.BANDITS + C.SUPERVISED + C.SUPERVISED_EXTRA     # policies drawn in this analysis
+LINE_NOTE = "Solid = bandits, dashed = frozen supervised models"
 LABEL = {"eps_greedy": "ε-greedy", "linucb": "LinUCB", "lints": "LinTS",
          "rf_frozen": "RF (frozen)", "xgb_frozen": "XGBoost (frozen)",
          "rf_monthly": "RF (monthly)", "xgb_monthly": "XGBoost (monthly)",
@@ -157,11 +159,12 @@ def _ci(x):
 
 def summary_table(m):
     out = []
-    for p in [x for x in C.POLICIES + C.SUPERVISED_EXTRA if x in set(m.policy)]:
+    for p in [x for x in C.REFERENCES + COMPETITORS if x in set(m.policy)]:
         row = {"policy": LABEL[p]}
         for s in [x for x in C.SCENARIOS if x in set(m.scenario)]:
             mu, h = _ci(m[(m.policy == p) & (m.scenario == s)].savings)
-            row[f"{s} savings"] = f"{100 * mu:.1f}%" + ("" if not np.isfinite(h) else f" ± {100 * h:.1f}")
+            row[f"{s} savings"] = ("–" if not np.isfinite(mu) else
+                                   f"{100 * mu:.1f}%" + ("" if not np.isfinite(h) else f" ± {100 * h:.1f}"))
         mu, h = _ci(m[m.policy == p].tfl_jan2020)
         row["Jan 2020 loss ($)"] = f"{mu:,.0f}" + ("" if not np.isfinite(h) else f" ± {h:,.0f}")
         for k in "BC":
@@ -190,7 +193,7 @@ def pairwise_tests(m):
     for s in sorted(set(m.scenario)):
         ms = m[m.scenario == s].pivot_table(index="seed", columns="policy", values="tfl")
         for b in C.BANDITS:
-            for sp in C.SUPERVISED + C.SUPERVISED_EXTRA:
+            for sp in [x for x in COMPETITORS if x not in C.BANDITS]:
                 if b not in ms or sp not in ms:
                     continue
                 d = (ms[b] - ms[sp]).dropna()
@@ -284,8 +287,8 @@ def figure1(runs, scenario, outdir):
     ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=9)
     ax.legend(frameon=False, fontsize=8, ncol=4, loc="upper left", bbox_to_anchor=(0, -0.08))
     n = max(len(v) for v in series.values())
-    fig.text(0.01, 0.005, f"Mean over {n} seed(s); band = range across seeds. Lines: solid = bandits, "
-             "dashed = frozen supervised models.", fontsize=7.5, color=INK2)
+    fig.text(0.01, 0.005, f"Mean over {n} seed(s); band = range across seeds. {LINE_NOTE}.",
+             fontsize=7.5, color=INK2)
     fig.tight_layout(rect=(0, 0.03, 0.86, 1))
     fig.savefig(os.path.join(outdir, f"fig1_cumulative_tfl_{scenario}.png"))
     plt.close(fig)
@@ -357,9 +360,11 @@ def figure3(runs, scenario, outdir):
     plt.close(fig)
 
 
-def figure_all_scenarios(runs, outdir):
-    """One figure, one panel per scenario: cumulative Total Financial Loss per policy
-    (mean over seeds, band = range across seeds), with a line where each change enters."""
+def figure_all_scenarios(runs, outdir, col="cost", what="Total Financial Loss",
+                         filename="fig_all_scenarios_cumulative_tfl.png"):
+    """One figure, one panel per scenario: the cumulative 2020 value of `col` per policy
+    (mean over seeds, band = range across seeds), with a line where each change enters.
+    col="cost" -> Total Financial Loss; col="fraud_loss" -> fraud let through."""
     import matplotlib.pyplot as plt
     import matplotlib.dates as mdates
     scen = [s for s in C.SCENARIOS if any(i["scenario"] == s for i, _ in runs)]
@@ -369,7 +374,7 @@ def figure_all_scenarios(runs, outdir):
     for info, arr in runs:
         p = info["policy"]
         if p in COMPETITORS + ["oracle"]:
-            series.setdefault((info["scenario"], p), []).append(weekly(_frame(arr)).cumsum())
+            series.setdefault((info["scenario"], p), []).append(weekly(_frame(arr), col).cumsum())
     ncol = 3 if len(scen) > 2 else len(scen)
     nrow = int(np.ceil(len(scen) / ncol))
     fig, axes = plt.subplots(nrow, ncol, figsize=(5.2 * ncol, 3.9 * nrow + 1.0), dpi=200, squeeze=False)
@@ -397,17 +402,18 @@ def figure_all_scenarios(runs, outdir):
     for ax in axes.flat[len(scen):]:
         ax.set_visible(False)
     for ax in axes[:, 0]:
-        ax.set_ylabel("Cumulative loss (US$ thousands)", color=INK2, fontsize=8.5)
+        ax.set_ylabel(("Cumulative fraud let through" if col == "fraud_loss" else "Cumulative loss")
+                      + " (US$ thousands)", color=INK2, fontsize=8.5)
     order = [p for p in COMPETITORS + ["oracle"] if p in handles]
     fig.legend([handles[p] for p in order], [LABEL[p] for p in order], loc="upper left",
                bbox_to_anchor=(0.01, 0.965), ncol=min(len(order), 8), frameon=False, fontsize=8.5)
-    fig.suptitle("Cumulative Total Financial Loss in 2020, all scenarios", x=0.01, ha="left",
+    fig.suptitle(f"Cumulative {what} in 2020, all scenarios", x=0.01, ha="left",
                  fontsize=12, color=INK)
     fig.text(0.01, 0.005, f"Mean over {seeds} seed(s); band = range across seeds. Vertical lines mark where each "
-             "change enters. Solid = bandits, dashed = frozen supervised models, grey = oracle. "
+             f"change enters. {LINE_NOTE}, grey = oracle. "
              "Each panel has its own y-axis scale.", fontsize=7.5, color=INK2)
     fig.tight_layout(rect=(0, 0.02, 1, 0.935))
-    fig.savefig(os.path.join(outdir, "fig_all_scenarios_cumulative_tfl.png"))
+    fig.savefig(os.path.join(outdir, filename))
     plt.close(fig)
 
 
@@ -512,7 +518,7 @@ def figure_all_weekly(runs, outdir):
                  color=INK, y=0.995)
     seeds = max((len(v) for v in data.values()), default=0)
     fig.text(0.01, 0.003, f"Mean over {seeds} seed(s). Vertical lines mark where each change enters. "
-             "Solid = bandits, dashed = frozen supervised models. Each panel has its own y-axis scale.",
+             f"{LINE_NOTE}. Each panel has its own y-axis scale.",
              fontsize=7.5, color=INK2)
     fig.tight_layout(rect=(0, 0.01, 1, 0.955))
     fig.savefig(os.path.join(outdir, "fig_all_scenarios_weekly_fraud_loss.png"))
@@ -527,18 +533,19 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--results", default=C.RESULTS_DIR)
     ap.add_argument("--graphs", default=C.GRAPHS_DIR)
+    ap.add_argument("--tables", default=None, help="default: <results>/tables")
     ap.add_argument("--figure-scenario", nargs="+", default=["S1"])
     a = ap.parse_args(argv)
     bad = [x for x in a.figure_scenario if x not in C.SCENARIOS]
     if bad:
         raise SystemExit(f"unknown scenario(s) {bad} for --figure-scenario; choose from {C.SCENARIOS}")
-    runs = load_runs(a.results)
+    runs = [r for r in load_runs(a.results) if r[0]["policy"] in C.REFERENCES + COMPETITORS]
     if not runs:
         raise SystemExit(f"no runs found in {os.path.join(a.results, 'runs')}; run 'python main.py run' first")
     missing = [x for x in a.figure_scenario if x not in {i["scenario"] for i, _ in runs}]
     if missing:
         print(f"note: no runs yet for {missing}; their figures are skipped")
-    outdir = os.path.join(a.results, "tables")
+    outdir = a.tables or os.path.join(a.results, "tables")
     os.makedirs(outdir, exist_ok=True)
     os.makedirs(a.graphs, exist_ok=True)
     m = run_metrics(runs)
@@ -548,13 +555,15 @@ def main(argv=None):
     with open(os.path.join(outdir, "summary_table.md"), "w", encoding="utf-8") as f:
         f.write(markdown_table(t))
     pairwise_tests(m).to_csv(os.path.join(outdir, "pairwise_tests.csv"), index=False, encoding="utf-8-sig")
-    for s in a.figure_scenario:
+    #for s in a.figure_scenario:
         #figure1(runs, s, a.graphs)
         #figure2(m, s, a.graphs)
-        figure3(runs, s, a.graphs)
+        #figure3(runs, s, a.graphs)
     figure_all_scenarios(runs, a.graphs)
+    figure_all_scenarios(runs, a.graphs, col="fraud_loss", what="Fraud Let Through",
+                         filename="fig_all_scenarios_cumulative_fraud_let_through.png")
     figure_all_breakdown(m, a.graphs)
-    #figure_all_weekly(runs, a.graphs)
+    figure_all_weekly(runs, a.graphs)
     print(t.to_string(index=False))
     print(f"\ntables written to {outdir}\nfigures written to {a.graphs}")
 

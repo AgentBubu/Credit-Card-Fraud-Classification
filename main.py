@@ -12,13 +12,18 @@ Commands
   python main.py tune     [--jobs 4]                    tune bandit settings on 2019 only
   python main.py run      [--scenarios S1] [--seeds 0] [--policies all] [--jobs 4]
   python main.py check                                  consistency checks on finished runs
-  python main.py analyze  [--figure-scenario S1 S5]     tables + Figures 1-3
+  python main.py analyze  [--figure-scenario S1 S5]     tables + Figures 1-3 (frozen models and bandits)
+  python main.py analyze-retrain [--figure-scenario S1] same, adding the monthly-retrained models
   python main.py all      [--seeds all] [--jobs 4]      everything above, in order
 
 Examples
   python main.py run --scenarios S1 --seeds 0 --jobs 4            # pilot (a few minutes)
   python main.py analyze --figure-scenario S1
   python main.py all --jobs 4                                     # full experiment
+
+Monthly-retrained models (optional, reported separately)
+  python main.py run --scenarios all --seeds all --policies rf_monthly xgb_monthly --jobs 4
+  python main.py analyze-retrain --figure-scenario S1             # Graphs/retraining/
 """
 import os
 import sys
@@ -46,7 +51,7 @@ def main():
         print(__doc__)
         return
     cmd, rest = sys.argv[1], sys.argv[2:]
-    from fcmab import analysis, checks, config, run, tune
+    from fcmab import analysis, analysis_retrain, checks, config, run, tune
 
     if cmd == "tune":
         tune.main(rest)
@@ -56,6 +61,8 @@ def main():
         raise SystemExit(checks.main())
     elif cmd in ("analyze", "analyse"):
         analysis.main(rest)
+    elif cmd in ("analyze-retrain", "analyse-retrain"):
+        analysis_retrain.main(rest)
     elif cmd == "all":
         jobs = _opt(rest, "--jobs", [str(os.cpu_count() or 2)])
         seeds = _opt(rest, "--seeds", ["all"])

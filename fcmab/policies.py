@@ -253,7 +253,7 @@ def make(name, d, seed):
         return Oracle()
     if name in C.BANDITS:
         return LinearBandit(name, d, rng)
-    if name in C.SUPERVISED + C.SUPERVISED_EXTRA:
+    if name in C.SUPERVISED + C.RETRAINED + C.SUPERVISED_EXTRA:
         model, mode = name.split("_")
         return Supervised(model, mode, seed)
     raise ValueError(name)
