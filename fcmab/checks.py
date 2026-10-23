@@ -1,12 +1,17 @@
 """Consistency checks on finished runs (run after an experiment, before trusting results).
 
-  python main.py check
+  python main.py check                 invariants over the stored logs
+  python main.py check --replay 12     re-simulate 12 runs and compare every column
 
 Checks, for every run found:
   1. cost accounting: TFL = fraud let through + MFA cost + review cost
   2. only fraud is ever auto-declined by a blocked card
   3. no policy beats the oracle, and approve_all equals the fraud let through
   4. every policy saw the same number of transactions as approve_all (same stream; not S5)
+
+The stored logs cannot tell you that the code still produces them, so `--replay` does:
+it re-runs the simulator from the scenario cache and diffs every logged column, which is
+how the block-level rewrite is checked against the published corpus.
 """
 import numpy as np
 
@@ -14,7 +19,14 @@ from . import analysis as A
 from . import config as C
 
 
-def main():
+def main(argv=None):
+    argv = list(argv or [])
+    if "--replay" in argv:
+        from . import fingerprint
+        i = argv.index("--replay") + 1
+        n = int(argv[i]) if i < len(argv) and argv[i].isdigit() else 12
+        return len(fingerprint.replay(n))
+    runs = A.load_runs()
     runs = A.load_runs()
     problems = 0
     n_tx = {}

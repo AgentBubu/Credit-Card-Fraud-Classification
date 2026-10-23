@@ -105,6 +105,8 @@ class LinearBandit(Policy):
         self.rng = rng
         self.d_base = d
         self.leaf_model = None
+        self.tie_tols = None                      # set by fingerprint.census; None on the normal path
+        self.tie_counts = None
 
     # --- context
     def _leaf_onehot(self, Xb):
@@ -177,11 +179,28 @@ class LinearBandit(Policy):
         if self.kind == "eps_greedy":
             if self.rng.random() < C.EPSILON:
                 return int(self.rng.integers(3))
-            return int(np.argmax(mean))
+            a = int(np.argmax(mean))
+            self._tie_gap(mean)
+            return a
         width = np.sqrt(np.maximum(np.einsum("aij,i,j->a", self.Ainv[:, nz][:, :, nz], zn, zn), 0.0))
         if self.kind == "linucb":
-            return int(np.argmax(mean + C.ALPHA * width))
-        return int(np.argmax(mean + C.TS_SCALE * width * self.rng.standard_normal(3)))
+            score = mean + C.ALPHA * width
+            a = int(np.argmax(score))
+            self._tie_gap(score)
+            return a
+        score = mean + C.TS_SCALE * width * self.rng.standard_normal(3)
+        a = int(np.argmax(score))
+        self._tie_gap(score)
+        return a
+
+    def _tie_gap(self, score):
+        """Near-tie census (fingerprint.census); costs nothing while tie_tols is None."""
+        if self.tie_tols is None:
+            return
+        s = np.sort(score)
+        gap = float(s[-1] - s[-2])                 # decisions are argmax, so the top two matter
+        for k, tol in enumerate(self.tie_tols):
+            self.tie_counts[k] += gap <= tol
 
     def update(self, a, z, r):
         Ai = self.Ainv[a]

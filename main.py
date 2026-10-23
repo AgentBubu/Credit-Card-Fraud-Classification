@@ -12,6 +12,10 @@ Commands
   python main.py tune     [--jobs 4]                    tune bandit settings on 2019 only
   python main.py run      [--scenarios S1] [--seeds 0] [--policies all] [--jobs 4]
   python main.py check                                  consistency checks on finished runs
+  python main.py check --replay 12                      re-simulate runs and diff every column
+  python main.py fingerprint [--out PATH]               hash every run (reference for rewrites)
+  python main.py fingerprint --census [--scenarios S1 S5] [--seeds 0] [--jobs 6]
+                                                        how often a bandit's top two actions tie
   python main.py analyze  [--figure-scenario S1 S5]     tables + Figures 1-3 (frozen models and bandits)
   python main.py analyze-retrain [--figure-scenario S1] same, adding the monthly-retrained models
   python main.py all      [--seeds all] [--jobs 4]      everything above, in order
@@ -51,14 +55,16 @@ def main():
         print(__doc__)
         return
     cmd, rest = sys.argv[1], sys.argv[2:]
-    from fcmab import analysis, analysis_retrain, checks, config, run, tune
+    from fcmab import analysis, analysis_retrain, checks, config, fingerprint, run, tune
 
     if cmd == "tune":
         tune.main(rest)
     elif cmd == "run":
         run.main(rest)
     elif cmd == "check":
-        raise SystemExit(checks.main())
+        raise SystemExit(checks.main(rest))
+    elif cmd == "fingerprint":
+        raise SystemExit(fingerprint.main(rest))
     elif cmd in ("analyze", "analyse"):
         analysis.main(rest)
     elif cmd in ("analyze-retrain", "analyse-retrain"):

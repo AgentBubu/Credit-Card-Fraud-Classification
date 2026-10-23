@@ -124,7 +124,7 @@ class AdversarialStream:
 
 # ============================================================================= run
 def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, history_start=None,
-        verbose=False):
+        verbose=False, tie_tols=None):
     t_wall = time.time()
     d = d if d is not None else D.build(scenario, seed)
     t0, t1 = ns(test_start or C.TEST_START), ns(test_end or C.TEST_END)
@@ -137,6 +137,9 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
     hist = np.flatnonzero((ts >= h0) & (ts < t0) & (d["version"] == 0))
     Xh = np.column_stack([X[hist], mr_full[hist]])
     pol = P.make(policy_name, Xh.shape[1], seed)
+    if tie_tols is not None and pol.is_bandit:
+        pol.tie_tols = list(tie_tols)             # fingerprint.census: count near-ties while acting
+        pol.tie_counts = np.zeros(len(tie_tols), np.int64)
     # frozen / monthly / quarterly versions of one model share the same 2019 starting model
     key = getattr(pol, "model_kind", policy_name)
     rng_pol = np.random.default_rng([seed, 11, sum(map(ord, key))])
@@ -256,6 +259,8 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
     )
     info = dict(scenario=scenario, seed=seed, policy=policy_name, seconds=round(time.time() - t_wall, 1),
                 n_retrain=n_retrain, tfl=float(out["cost"].sum()), xgboost=P.HAVE_XGB)
+    if getattr(pol, "tie_counts", None) is not None:
+        info["tie_counts"] = [int(v) for v in pol.tie_counts]
     if scenario == "S5":
         info["adversary_monthly_probs"] = [(m, float(a), float(b), float(c)) for m, a, b, c in stream.history]
     if verbose:
