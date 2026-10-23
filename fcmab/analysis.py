@@ -199,7 +199,9 @@ def pairwise_tests(m):
                 d = (ms[b] - ms[sp]).dropna()
                 mu, h = _ci(d)
                 p = np.nan
-                if len(d) >= 5 and (d != 0).any():
+                if len(d) >= 6 and (d != 0).any():
+                    # exact two-sided Wilcoxon floor: n=5 cannot go below p=0.0625, so 5 seeds
+                    # would report "no significant difference" however large the gap is.
                     p = stats.wilcoxon(d).pvalue
                 rows.append(dict(scenario=s, bandit=LABEL[b], supervised=LABEL[sp], n_seeds=len(d),
                                  mean_tfl_difference=mu, ci95=h, wilcoxon_p=p,
