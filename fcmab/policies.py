@@ -105,6 +105,7 @@ class LinearBandit(Policy):
         self.rng = rng
         self.d_base = d
         self.leaf_model = None
+        self.nz = slice(None)      # context columns to index: slice(None) = all of them (a view, no copy)
 
     # --- context
     def _leaf_onehot(self, Xb):
@@ -151,6 +152,7 @@ class LinearBandit(Policy):
                 self.leaf_maps.append(m)
             self.n_leaves = off
         self.d = self.d_base + 2 * self.n_leaves + 1
+        self.nz = None if self.leaf_model is not None else slice(None)   # None -> find them per row
         i_sc = rng.choice(n, min(C.SCALER_N, n), replace=False)
         Xs = np.asarray(X[i_sc], dtype=np.float64)
         self.mu, sd = Xs.mean(0), Xs.std(0)
@@ -171,7 +173,7 @@ class LinearBandit(Policy):
             self.theta[a] = Ainv @ self.b[a]
 
     def act(self, z):
-        nz = np.flatnonzero(z)                     # z is sparse: use only its non-zero entries
+        nz = self.nz if self.nz is not None else np.flatnonzero(z)
         zn = z[nz]
         mean = self.theta[:, nz] @ zn
         if self.kind == "eps_greedy":
@@ -185,7 +187,7 @@ class LinearBandit(Policy):
 
     def update(self, a, z, r):
         Ai = self.Ainv[a]
-        nz = np.flatnonzero(z)
+        nz = self.nz if self.nz is not None else np.flatnonzero(z)
         Az = Ai[:, nz] @ z[nz]
         Ai -= np.outer(Az, Az) / (1.0 + z[nz] @ Az[nz])          # Sherman-Morrison rank-one update
         self.b[a, nz] += r * z[nz]
