@@ -28,6 +28,7 @@ SECOND_SHIFT = "2020-07-01"    # second shift in S1
 
 # ----------------------------------------------------------------------------- scenarios, policies, seeds
 SCENARIOS = ["S0", "S1", "S2", "S3", "S4", "S5"]
+BUILD_JOBS = 8          # scenario caches built at once; each process peaks at ~2.6 GB
 SEEDS = list(range(10))
 BANDITS = ["eps_greedy", "linucb", "lints"]
 SUPERVISED = ["rf_frozen", "xgb_frozen"]        # trained on 2019, never retrained

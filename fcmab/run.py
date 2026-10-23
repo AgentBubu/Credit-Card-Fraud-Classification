@@ -23,6 +23,15 @@ def run_path(scenario, seed, policy):
     return os.path.join(C.RESULTS_DIR, "runs", scenario, f"seed{seed}", policy)
 
 
+def _build_job(job):
+    """Generate one scenario cache in its own process (they are independent and seed-deterministic)."""
+    scenario, seed = job
+    from . import data
+    t = time.time()
+    data.build(scenario, seed, verbose=False)
+    return f"built  {scenario} seed{seed}  {time.time() - t:5.0f}s"
+
+
 def _worker(job):
     scenario, seed, policy, params = job
     from . import config, data, simulator
@@ -59,9 +68,27 @@ def main(argv=None):
     policies = C.POLICIES if a.policies == ["all"] else a.policies
 
     from . import data
-    for s in scenarios:                          # build scenario data once, before the workers start
+    # one cache per scenario_key: S0 and S3 ignore the seed, so many (scenario, seed) pairs
+    # share them. Deduping also keeps two builders out of the same cache directory.
+    seen, todo = set(), []
+    for s in scenarios:
         for k in seeds:
-            data.build(s, k)
+            key = data.scenario_key(s, k)
+            if key not in seen and not os.path.exists(os.path.join(C.CACHE_DIR, key, "meta.json")):
+                seen.add(key)
+                todo.append((s, k))
+    if todo:                                    # ~1.5-3.5 min per cache, so build them in parallel
+        nb = min(a.jobs, C.BUILD_JOBS, len(todo))
+        t = time.time()
+        print(f"building {len(todo)} scenario caches on {nb} processes", flush=True)
+        if nb == 1:
+            for j in todo:
+                print(_build_job(j), flush=True)
+        else:
+            with get_context("spawn").Pool(nb, maxtasksperchild=1) as pool:
+                for msg in pool.imap_unordered(_build_job, todo):
+                    print(msg, flush=True)
+        print(f"caches ready in {(time.time() - t) / 60:.1f} min", flush=True)
     jobs = [(s, k, p, a.params) for s in scenarios for k in seeds for p in policies
             if a.rerun or not os.path.exists(run_path(s, k, p) + ".json")]
     # slowest jobs first, so the cores stay busy at the end
