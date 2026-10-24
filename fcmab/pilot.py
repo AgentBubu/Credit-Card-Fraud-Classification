@@ -19,7 +19,7 @@ from . import analysis
 from . import config as C
 
 #: pilot policy -> the corpus policy it is the one-change variant of (default: itself)
-TWIN = {"sqcb_rf_frozen": "rf_frozen"}
+TWIN = {"sqcb_rf_frozen": "rf_frozen", "sqcb_rf_monthly": "rf_monthly"}
 
 #: the step 1 stop gate, written in PLAN-tree-bandit.md before anything was run
 GATE_STEP1_REL = -0.20

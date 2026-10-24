@@ -37,16 +37,19 @@ SUPERVISED_EXTRA = []                            # 28 h grid and only repeated r
 REFERENCES = ["approve_all", "oracle"]          # not competitors: savings baseline and lower bound
 POLICIES = REFERENCES + BANDITS + SUPERVISED + RETRAINED
 # Step 2 of PLAN-tree-bandit.md: supervised oracle + non-uniform exploration. Deliberately kept
-# out of POLICIES while it is a pilot (Results/pilot-tree/), so the grid, tables and figures of
-# the 480-run corpus stay exactly as committed.
-SQUARECB = ["sqcb_rf_frozen"]
+# out of POLICIES while it is a pilot (Results/pilot/), so the grid, tables and figures of the
+# 480-run corpus stay exactly as committed. _frozen measures the price of exploration on its own
+# (that oracle cannot use what it explores for); _monthly is the version where exploration can
+# pay, because the retraining step sees the labels the explored actions produced.
+SQUARECB = ["sqcb_rf_frozen", "sqcb_rf_monthly"]
 
 #: Measured seconds per run on this machine (one core, dataset already built), from the 420-run
 #: corpus and the monthly pilot. Only used to print an ETA before a grid starts - nothing reads
 #: it for correctness, so it is fine for it to be rough.
 RUN_COST_S = {"rf_monthly": 1160.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
               "xgb_frozen": 59.0, "xgb_monthly": 360.0, "eps_greedy": 52.0,
-              "sqcb_rf_frozen": 120.0, "oracle": 2.5, "approve_all": 2.0}
+              "sqcb_rf_frozen": 120.0, "sqcb_rf_monthly": 1262.0,
+              "oracle": 2.5, "approve_all": 2.0}
 
 #: Cold build of one scenario cache, measured on this box (309 s for S1 seed 0, 352 MB on disk).
 CACHE_BUILD_S = 300.0
@@ -85,8 +88,10 @@ TS_SCALE = 0.3         # LinTS posterior scale v
 WARM_N = 50_000        # number of random history transactions used to warm-start the bandits
 # OPTIONAL, off in the agreed design: tree-leaf features for the bandits (He et al., 2014).
 # A small forest is fitted once on history; each transaction's leaf in every tree becomes a 0/1
-# feature, plus an amount-scaled copy (amount/100). Tested during development: it reduced the
-# linear bandits' January 2020 loss from about $35k to about $18k (frozen RF: about $1.9k).
+# feature, plus an amount-scaled copy (amount/100). Measured on S0/S1 x seeds 0-2 against the same
+# runs with this off (Results/pilot/leaf): TFL -67% for eps-greedy and -55% for LinUCB, 6/6 cells
+# better, and the bandit's fraud loss drops to rf_monthly's level - what stays behind is the cost
+# of intervening, not the detection. The price is runtime: 1,041 s per run instead of 78-146 s.
 USE_LEAF_FEATURES = False
 LEAF_TREES = 10
 LEAF_MAX_LEAVES = 16
