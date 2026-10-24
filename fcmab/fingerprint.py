@@ -2,7 +2,7 @@
 
 `main.py check` only re-reads the stored logs, so it cannot see a change in simulator
 behaviour. `replay()` re-simulates a run from its own scenario cache and compares every
-stored column, which is what makes the block-level rewrite testable: a run either still
+stored column, which is what makes any simulator rewrite testable: a run either still
 produces the same 927,544 decisions or the comparison says which one did not.
 
 `fingerprints()` hashes the whole corpus so any later rewrite can be diffed against the
@@ -119,6 +119,12 @@ def replay(n=12, paths=None, verbose=True):
     bad = []
     for sc, seed, pol, path in rs:
         d = data.build(sc, seed, verbose=False)
+        # Replay with the settings the run was made with, not today's defaults: the corpus
+        # outlived a re-tune, so comparing stored runs against default-parameter runs
+        # reports differences that are not in the code. The snapshot holds every knob a
+        # policy reads, so applying it also isolates one run from the previous one.
+        with open(path + ".json", encoding="utf-8") as f:
+            config.apply(json.load(f).get("params") or {})
         out, info = simulator.run(sc, seed, pol, d=d)
         diffs = []
         n_rows = 0

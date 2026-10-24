@@ -163,6 +163,11 @@ retrained forest beats both frozen models.
 - The 2019 tuning set is a single slice; `tune` prefers `WARM_N=600000` and it loses
   out of sample (above). A proper answer needs tuning on more than one slice, which is a
   research change, not a runtime one.
+- The replay gate now applies each run's recorded parameter snapshot before re-simulating
+  (`fingerprint.replay`). Before that it reported the 180 re-tuned bandit runs as differences,
+  because it compared them against default-parameter simulations - a gate that cries wolf is
+  worse than no gate. `census()` still simulates at current defaults, so do not read its tie
+  counts as describing the stored runs after a re-tune.
 - `RUN_COST_S` is a measured constant for *this* machine, and it is only used for the ETA
   printout - wrong values mislead nobody but the printout.
 - Cold builds are capped at 12 concurrent because this box currently has 20 GiB free (a
