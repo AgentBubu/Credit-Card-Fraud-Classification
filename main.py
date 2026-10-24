@@ -10,7 +10,7 @@ Project layout
 
 Commands
   python main.py tune     [--jobs 4]                    tune bandit settings on 2019 only
-  python main.py run      [--scenarios S1] [--seeds 0] [--policies all] [--jobs 4]
+  python main.py run      [--scenarios S1] [--seeds 0] [--policies all] [--jobs 28] [--plan]
   python main.py check                                  consistency checks on finished runs
   python main.py check --replay 12                      re-simulate runs and diff every column
   python main.py fingerprint [--out PATH]               hash every run (reference for rewrites)
@@ -26,7 +26,7 @@ Examples
   python main.py all --jobs 4                                     # full experiment
 
 Monthly-retrained models (optional, reported separately)
-  python main.py run --scenarios all --seeds all --policies rf_monthly xgb_monthly --jobs 4
+  python main.py run --scenarios all --seeds all --policies rf_monthly --jobs 28 --plan
   python main.py analyze-retrain --figure-scenario S1             # Graphs/retraining/
 """
 import os
@@ -78,6 +78,7 @@ def main():
         run.main(["--scenarios", "all", "--seeds", *seeds, "--jobs", *jobs])
         checks.main()
         analysis.main(["--figure-scenario", "S1", "S5"])
+        analysis_retrain.main(["--figure-scenario", "S1"])
     else:
         print(f"unknown command '{cmd}'\n")
         print(__doc__)

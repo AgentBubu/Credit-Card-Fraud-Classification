@@ -153,6 +153,12 @@ def _arrays(df, categories, merchants, cards):
     return arr, names
 
 
+def cached(scenario, seed, cache_dir=None):
+    """True if this scenario-seed has already been generated on disk."""
+    path = os.path.join(cache_dir or C.CACHE_DIR, scenario_key(scenario, seed))
+    return os.path.exists(os.path.join(path, "meta.json"))
+
+
 def build(scenario, seed, data_dir=None, cache_dir=None, verbose=True):
     """Generate (or load from cache) one scenario. Returns a dict of arrays + meta."""
     data_dir = data_dir or C.DATA_DIR

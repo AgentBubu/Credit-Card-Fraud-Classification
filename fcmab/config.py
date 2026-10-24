@@ -32,10 +32,20 @@ SEEDS = list(range(10))
 BANDITS = ["eps_greedy", "linucb", "lints"]
 SUPERVISED = ["rf_frozen", "xgb_frozen"]        # trained on 2019, never retrained
 # retrained every month on the labels received so far; reported separately (python main.py analyze-retrain)
-RETRAINED = ["rf_monthly", "xgb_monthly"]
-SUPERVISED_EXTRA = []
+RETRAINED = ["rf_monthly"]                      # xgb_monthly dropped: it cost 6.7 h of the
+SUPERVISED_EXTRA = []                            # 28 h grid and only repeated rf's conclusion
 REFERENCES = ["approve_all", "oracle"]          # not competitors: savings baseline and lower bound
-POLICIES = REFERENCES + BANDITS + SUPERVISED
+POLICIES = REFERENCES + BANDITS + SUPERVISED + RETRAINED
+
+#: Measured seconds per run on this machine (one core, dataset already built), from the 420-run
+#: corpus and the monthly pilot. Only used to print an ETA before a grid starts - nothing reads
+#: it for correctness, so it is fine for it to be rough.
+RUN_COST_S = {"rf_monthly": 900.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
+              "xgb_frozen": 59.0, "xgb_monthly": 360.0, "eps_greedy": 52.0,
+              "oracle": 2.5, "approve_all": 2.0}
+
+#: Cold build of one scenario cache, measured on this box (309 s for S1 seed 0, 352 MB on disk).
+CACHE_BUILD_S = 300.0
 
 # ----------------------------------------------------------------------------- actions and costs (simplified matrix, US$)
 APPROVE, MFA, REVIEW, DECLINED = 0, 1, 2, 3    # DECLINED = auto-declined because the card was already blocked
