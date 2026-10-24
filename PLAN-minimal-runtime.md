@@ -16,7 +16,7 @@ Everything below was measured on this box (56 cores, 112 GiB RAM), not estimated
 | inside one rf_frozen run | model scoring 48%, the 2019 fit ~49%, the day-by-day loop ~3% |
 | one rf_monthly run | **1,158 s** (11 retrains), vs 114 s for rf_frozen; 830 s only when the box is otherwise idle |
 | cold build of one scenario cache | **309 s**, 352 MB on disk |
-| worker memory per run | **0.17-0.35 GiB** (feature matrices are memory-mapped) |
+| worker memory per run | 0.17-0.35 GiB **at `WARM_N=50000`** (feature matrices are memory-mapped) - superseded, see "Re-tuning the bandits" |
 | throughput already proven | 420 full re-simulations in ~40 min at 14 concurrent workers |
 
 Two conclusions follow directly, and both were surprises:
@@ -89,6 +89,7 @@ single-threaded
 
 | situation | command | expected wall |
 |---|---|---|
+| **measured, 2026-10-24** | `python main.py all --retune --jobs 28` | **63 min** end to end (tune 19:46 -> figures 20:49), 30.08 CPU-hours of grid |
 | this box, caches and 420 runs on disk | `python main.py all --jobs 28` | ~44 min (60 rf_monthly runs left) |
 | fresh clone, warm nothing | `python main.py all --jobs 28` | ~25 min caches + ~55 min runs + ~3 min analyse = **~83 min** |
 | fresh clone, more cores | `python main.py all --jobs 36` | ~25 min + ~43 min + ~3 min = ~71 min |
@@ -101,17 +102,76 @@ weakens the statistics; it stays available as `--seeds` rather than being the de
 Dropping `xgb_monthly` is a scope change, not a speed trick: this branch can no longer say
 "retraining helps for both model families", only "for the random forest".
 
+## Re-tuning the bandits, and what it cost
+
+The first real run of `all` included `--retune`, and the new optimum was not the tuning the
+420-run corpus had been built with. `tune` scores candidates on 2019 only:
+
+| bandit | best on 2019 | previous corpus setting (`WARM_N=50000`) |
+|---|---|---|
+| eps_greedy | $318,557 (`WARM_N=600000, EPSILON=0.001`) | $340,965 |
+| linucb | $314,862 (`WARM_N=600000, ALPHA=0.03`) | $341,963 |
+| lints | $317,889 (`WARM_N=600000, TS_SCALE=0.03`) | $340,891 |
+
+All 180 bandit runs were re-run at the new optimum (3.6 CPU-hours, 0 problems afterwards,
+fingerprints regenerated; the pre-retune fingerprints are in
+`%TEMP%\corpus_fingerprints_pre-retune.json`).
+
+**Two things that came out of it that are easy to get wrong.**
+
+1. **Memory.** At `WARM_N=600000` twenty of the 180 runs died with
+   `numpy._core._exceptions._ArrayMemoryError: Unable to allocate 1.77 MiB for an array with
+   shape (1852394,) and data type bool` at `--jobs 28`, and zero died at `--jobs 6`. Failing
+   on a 1.77 MiB array is the system commit limit, not a runaway allocation: the warm-up fits
+   a supervised model on 600k rows instead of 50k, and the box had ~20 GiB free because an
+   unrelated process (`strata`) held 78 GiB. The earlier "0.17-0.35 GiB per worker, RAM is not
+   a constraint" line was measured at `WARM_N=50000` and does not carry over. Size `--jobs` to
+   free RAM. Failed runs are never written, so re-running them is the whole recovery.
+2. **The better tuning transferred badly.** Out of sample the re-tuned bandits are worse on
+   five of six scenarios: mean TFL 585k against 564k before (+3.7%), with S5 going 423k ->
+   544k. The one gain is the drift scenario S3, 629k -> 524k. So the 2019 optimum was partly
+   tuning-slice overfitting.
+
+   **Do not "fix" this by putting `WARM_N=50000` back because its numbers look better.**
+   Choosing a tuning by its test-year TFL is leakage. What is on disk now is the defensible
+   choice: parameters selected on 2019 only, which is what `tune` reproduces. Open question
+   for the write-up: why two `tune` runs picked different warm-up lengths - if the search
+   space changed, say so instead of implying the procedure is unstable.
+
+The paper's conclusion is untouched by any of this: best bandit 585k against best supervised
+69k (rf_monthly), an 8.5x gap.
+
+## The measured result
+
+Mean TFL over the 60 cells (thousands of USD):
+
+| | approve_all | rf_frozen | xgb_frozen | **rf_monthly** | linucb | lints | eps | oracle |
+|---|---|---|---|---|---|---|---|---|
+| all scenarios | 1,545 | 143 | 143 | **69** | 585 | 586 | 589 | 5 |
+| S0 stable | 2,316 | 27 | 19 | **26** | 636 | 637 | 642 | 7 |
+| S3 drift | 1,483 | 242 | 262 | **61** | 524 | 525 | 527 | 7 |
+| S5 adversarial | 1,627 | 135 | 127 | **75** | 544 | 546 | 548 | 4 |
+
+Monthly retraining is worth **-$73.7k on average (-51% vs frozen)** and it is entirely a
+drift effect: -$1.6k on the stable S0, -$182k on S3. On drifting and adversarial scenarios the
+retrained forest beats both frozen models.
+
 ## Not done, and what to watch
 
-- `xgb_monthly` is out of scope, and the tables were checked only with zero and one retrained
-  run present (`analyze-retrain` prints the row with blank error bars and no crash). The
-  figures for the full 10-seed monthly set are still unmade, as are 59 of the 60 rf_monthly
-  runs - which is what the ~44 min above buys.
+- `xgb_monthly` is out of scope on this branch, so the retraining comparison is one model
+  family only: "retraining helps for the random forest", not "for both families".
+- The 2019 tuning set is a single slice; `tune` prefers `WARM_N=600000` and it loses
+  out of sample (above). A proper answer needs tuning on more than one slice, which is a
+  research change, not a runtime one.
 - `RUN_COST_S` is a measured constant for *this* machine, and it is only used for the ETA
   printout - wrong values mislead nobody but the printout.
 - Cold builds are capped at 12 concurrent because this box currently has 20 GiB free (a
   `strata` process is holding 78 GiB); on an idle 112 GiB box that cap could rise.
-- The corpus fingerprints in `Results/corpus_fingerprints.json` stay the reference for any
-  future engine change, together with `python main.py check --replay N`.
+- The corpus fingerprints in `Results/corpus_fingerprints.json` (480 runs, regenerated after
+  the re-tune) stay the reference for any future engine change, together with
+  `python main.py check --replay N`. They are not tracked by git - back them up when they
+  change.
 - Backups: 420 runs (428 MB) and both fingerprint files in `C:\fcmab_backup\runs_20261023\`
-  (same disk as the working copy - this is protection against mistakes, not drive failure).
+  (same disk as the working copy - this is protection against mistakes, not drive failure),
+  pre-retune fingerprints in `%TEMP%\corpus_fingerprints_pre-retune.json`. The grid on disk is
+  now 480 runs and is newer than that backup.
