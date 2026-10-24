@@ -193,3 +193,5 @@ retrained forest beats both frozen models.
   working copy, so it protects against mistakes, not against drive failure. The older
   `runs_20261023\` (420 runs) and the pre-retune fingerprints
   (`%TEMP%\corpus_fingerprints_pre-retune.json`) are kept for comparison.
+- Follow-on: the next improvement (tree-based bandits) was researched on 2026-10-25 and is
+  written up, with prior art and stop gates, in `PLAN-tree-bandit.md`. Not started.
