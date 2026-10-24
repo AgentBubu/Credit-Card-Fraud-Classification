@@ -10,6 +10,8 @@ Logs go to Results/runs/<scenario>/seed<k>/<policy>.npz (+ .json with run info).
 import argparse
 import json
 import os
+import sys
+import threading
 import time
 import traceback
 from multiprocessing import get_context
@@ -23,12 +25,73 @@ def run_path(scenario, seed, policy):
     return os.path.join(C.RESULTS_DIR, "runs", scenario, f"seed{seed}", policy)
 
 
+class _Bar:
+    """One-line progress display for the two slow phases: scenario caches, then runs.
+
+    It redraws from a background thread every 2 s because one rf_monthly run takes ~19
+    minutes, and a silent terminal is indistinguishable from a hung one. "cores" is
+    measured CPU seconds per wall second, so it also shows whether the pool is getting the
+    machine. When stdout is a file the bar is not redrawn in place - you get one line per
+    completion plus a heartbeat every minute, which is what makes a redirected log useful.
+    """
+
+    WIDTH = 28
+
+    def __init__(self, total, label, cost, jobs):
+        self.total, self.label, self.jobs = total, label, max(1, jobs)
+        self.cost_left, self.cost_done, self.done = float(cost), 0.0, 0
+        self.t0 = time.time()
+        self.tty = sys.stdout.isatty()
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def update(self, cost=0.0, msg=""):
+        """One unit finished; `cost` is its measured CPU seconds (0 = it was already cached)."""
+        with self._lock:
+            self.done += 1
+            self.cost_done += cost
+            self.cost_left = max(0.0, self.cost_left - cost)
+        if msg:
+            sys.stdout.write(("\r" + msg).ljust(96) if self.tty else msg)
+            sys.stdout.write("\n")
+        if self.tty:
+            self._draw()
+
+    def close(self):
+        self._stop.set()
+        self._thread.join(timeout=1)
+        self._draw()
+        if self.tty:
+            sys.stdout.write("\n")     # the bar has no line ending of its own
+        sys.stdout.flush()
+
+    def _loop(self):
+        while not self._stop.wait(2.0 if self.tty else 60.0):
+            self._draw()
+
+    def _draw(self):
+        el = time.time() - self.t0
+        with self._lock:
+            done, cost_done, cost_left = self.done, self.cost_done, self.cost_left
+        cores = cost_done / el if el > 1 else 0.0
+        eta = cost_left / (cores if cores > 0.05 else self.jobs)
+        frac = done / self.total if self.total else 1.0
+        line = (f"\r{self.label:5s} [{'#' * int(round(self.WIDTH * frac)):<{self.WIDTH}}] "
+                f"{done}/{self.total} {frac:4.0%}  {el / 60:5.1f} min gone  "
+                f"~{eta / 60:.0f} min left  {cores:4.1f} cores")
+        sys.stdout.write(line if self.tty else line.lstrip("\r") + "\n")
+        sys.stdout.flush()
+
+
 def _build(pair):
     """Build one scenario cache in a worker; returns at once if it is already on disk."""
     from . import data
     scenario, seed = pair
+    cold = not data.cached(scenario, seed)
     data.build(scenario, seed, verbose=False)
-    return f"built {scenario} seed{seed}"
+    return scenario, seed, cold
 
 
 def _worker(job):
@@ -46,9 +109,11 @@ def _worker(job):
             "C_MFA", "C_REV", "MFA_BYPASS", "UNDERSAMPLE_LEGIT")}
         with open(path + ".json", "w", encoding="utf-8") as f:
             json.dump(info, f, indent=1)
-        return f"done  {scenario} seed{seed} {policy:12s} {info['seconds']:7.1f}s  TFL ${info['tfl']:,.0f}"
+        return policy, info["seconds"], (
+            f"done  {scenario} seed{seed} {policy:12s} {info['seconds']:7.1f}s  "
+            f"TFL ${info['tfl']:,.0f}")
     except Exception:
-        return f"FAILED {scenario} seed{seed} {policy}\n{traceback.format_exc()}"
+        return policy, 0.0, f"FAILED {scenario} seed{seed} {policy}\n{traceback.format_exc()}"
 
 
 def main(argv=None):
@@ -90,22 +155,29 @@ def main(argv=None):
     # needs 60 of them, which is more CPU than the whole grid. Each build is one scenario-seed,
     # so they never collide; the cap is memory, not correctness (a build holds the raw frame).
     if len(todo) > 1 and a.jobs > 1:
+        bar = _Bar(len(todo), "cache", C.CACHE_BUILD_S * cold, min(a.jobs, 12))
         with get_context("spawn").Pool(min(a.jobs, 12), maxtasksperchild=1) as pool:
-            for msg in pool.imap_unordered(_build, todo):
-                print(msg, flush=True)
+            for s, k, was_cold in pool.imap_unordered(_build, todo):
+                bar.update(C.CACHE_BUILD_S if was_cold else 0.0, f"built {s} seed{k}")
     else:
+        bar = _Bar(len(todo), "cache", C.CACHE_BUILD_S * cold, 1)
         for sk in todo:
-            print(_build(sk), flush=True)
+            s, k, was_cold = _build(sk)
+            bar.update(C.CACHE_BUILD_S if was_cold else 0.0, f"built {s} seed{k}")
+    bar.close()
     # slowest jobs first, so the cores stay busy at the end
     jobs.sort(key=lambda j: (j[2] not in C.RETRAINED, j[2] not in C.BANDITS, j[2] not in C.SUPERVISED))
     t = time.time()
+    bar = _Bar(len(jobs), "runs", serial, a.jobs)
     if a.jobs == 1:
         for j in jobs:
-            print(_worker(j), flush=True)
+            _, secs, msg = _worker(j)
+            bar.update(secs, msg)
     else:
         with get_context("spawn").Pool(a.jobs, maxtasksperchild=1) as pool:
-            for msg in pool.imap_unordered(_worker, jobs):
-                print(msg, flush=True)
+            for policy, secs, msg in pool.imap_unordered(_worker, jobs):
+                bar.update(secs, msg)
+    bar.close()
     print(f"finished in {(time.time() - t) / 60:.1f} min")
 
 

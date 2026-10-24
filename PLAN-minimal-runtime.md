@@ -61,11 +61,24 @@ timing needs a direct old-vs-new comparison for the monthly policies, not just t
 | file | change | why |
 |---|---|---|
 | `fcmab/config.py` | `RETRAINED = ["rf_monthly"]`; `POLICIES` now includes the retrained model; new `RUN_COST_S`, `CACHE_BUILD_S` | xgb_monthly was 6.7 h of the 28 h grid and only repeated rf's retraining conclusion |
-| `fcmab/run.py` | caches built in a pool (capped at 12, memory-bound not correctness-bound); ETA printed from `RUN_COST_S`; `--plan` to see the job list and cost without running | 5.1 h of serial cache building became ~25 min of wall clock |
+| `fcmab/run.py` | caches built in a pool (capped at 12, memory-bound not correctness-bound); ETA printed from `RUN_COST_S`; `--plan` to see the job list and cost without running; one-line progress bar | 5.1 h of serial cache building became ~25 min of wall clock, and a 19-minute `rf_monthly` run no longer looks like a hang |
 | `fcmab/data.py` | `cached(scenario, seed)` | so the ETA can say how much cold building is left |
 | `main.py` | `all` also runs `analyze-retrain`; help text and examples updated for the new policy set | the retrained comparison is part of "results and graphs" |
 
-No new abstractions, no new modules: one helper, two constants, one flag.
+No new abstractions, no new modules, no new dependencies: one helper, one small class, two
+constants, one flag.
+
+The progress line redraws every 2 s in a terminal and once a minute in a redirected log:
+
+```
+runs  [##############              ] 24/59  41%   31.2 min gone  ~44 min left  26.8 cores
+done  S1 seed0 rf_monthly     1158.0s  TFL $83,363
+```
+
+`cores` is measured CPU seconds per wall second, so it answers "is the pool actually getting
+the machine" as well as "is it still alive". `~min left` divides the work still outstanding by
+`cores` (or by `--jobs`, before the first run finishes); the outstanding work starts as the
+`RUN_COST_S` estimate and is then reduced by each run's measured seconds.
 
 ## The budget
 
