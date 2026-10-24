@@ -168,8 +168,11 @@ retrained forest beats both frozen models.
   because it compared them against default-parameter simulations - a gate that cries wolf is
   worse than no gate. `census()` still simulates at current defaults, so do not read its tie
   counts as describing the stored runs after a re-tune.
-- Out of scope by decision, recorded so nobody rediscovers them: `xgb_monthly` (60 runs, ~2 h,
-  `run --policies xgb_monthly --jobs 8`) to complete the family x retraining 2x2; tuning on
+- Out of scope by decision, recorded so nobody rediscovers them: Figures 1-3 keep their frozen
+  7-policy set and the retraining exhibit is cited as `Graphs/retraining/` (not merged into the
+  main figures, so the main set keeps matching the reference the fingerprints vouch for);
+  `xgb_monthly` (60 runs, ~2 h, `run --policies xgb_monthly --jobs 8`) to complete the
+  family x retraining 2x2; tuning on
   more than one 2019 slice; further runtime work - the 1-1.5 h goal is met at 63 min.
 - `RUN_COST_S` is a measured constant for *this* machine, and it is only used for the ETA
   printout - wrong values mislead nobody but the printout.
@@ -180,8 +183,10 @@ retrained forest beats both frozen models.
   are the reference for any future engine change: the diff of that file *is* the answer to "did
   the engine change?". Keeping it outside git meant the reference existed on one disk.
 - Replay gate, current corpus: both `rf_monthly` runs replayed byte-identical - the first time
-  the monthly (retraining) path has ever round-tripped - and a random 10-run sample across
-  policies reports 0 differ. `python main.py check --replay N` is trustworthy again.
+  the monthly (retraining) path has ever round-tripped - and 8 further runs of a random
+  cross-policy sample replay clean (0 differ; the last few sample members, retrained runs at
+  ~19 min each, were still running when this was written). `check --replay N` is trustworthy
+  again; `tail Results/replay_validation.log` shows the final tally.
 - Sizing `--jobs` after the re-tune: free RAM here is ~19 GiB, so `--jobs 8`. Free failed runs
   are never written, so a re-run of the same command is the whole recovery.
 - Backups: `C:\fcmab_backup\runs_20261025\` holds all 480 runs (629 MB). Same disk as the
