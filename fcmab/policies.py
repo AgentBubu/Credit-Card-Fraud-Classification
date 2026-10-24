@@ -263,6 +263,53 @@ class Supervised(Policy):
         return np.argmin(exp_cost, axis=1).astype(np.int8)
 
 
+class SquareCB(Supervised):
+    """Supervised oracle + non-uniform exploration: SquareCB (Foster & Rakhlin 2020), in the
+    shape Adyen report for payment processing (arXiv 2412.00569): a forest scores the actions and
+    the decision is sampled instead of taken as argmin.
+
+    Expected cost per action is the greedy twin's (see Supervised.decide_batch), so with
+    b = argmin cost:
+        p_a = 1 / (MU + GAMMA * (cost_a - cost_b))      a != b
+        p_b = 1 - sum_a p_a
+    Reward is US$, hence GAMMA is scaled in dollars: with MU = 10 a $2 gap still explores at the
+    1/MU floor while a $1000 gap explores at ~1%. GAMMA -> infinity would be greedy.
+    Nothing is learned from the bandit's own feedback: the oracle is refit only on the schedule
+    of `mode` (frozen = never). That makes the comparison against the same model's greedy twin
+    (rf_frozen) an exact measurement of the price of exploration.
+    """
+    is_bandit = True
+    batch = False
+
+    def __init__(self, model, mode, rng):
+        super().__init__(model, mode, int(rng.integers(1 << 30)))
+        self.rng = rng
+        self.name = f"sqcb_{model}_{mode}"
+
+    def transform(self, X):
+        """Score the whole day in one vectorised call (a per-row predict_proba through isotonic
+        calibration over 3 folds would dominate the run) and pass act() only what it needs:
+        the fraud probability and the amount (column 0 is log(1 + amount))."""
+        p = self.predict(X)
+        return np.column_stack([p, np.expm1(np.asarray(X, dtype=np.float64)[:, 0])])
+
+    def act(self, z):
+        p, amt = z
+        cost = np.array([p * amt,                              # approve: expected fraud loss
+                         C.C_MFA + C.MFA_BYPASS * p * amt,     # MFA: fee + the bypassed share
+                         C.C_REV])                             # review: flat
+        b = int(np.argmin(cost))
+        pr = np.array([1.0 / (C.SQCB_MU + C.SQCB_GAMMA * (c - cost[b])) if a != b else 0.0
+                       for a, c in enumerate(cost)])
+        if pr.sum() > 1.0:                 # only reachable below MU = 2; keep it a distribution
+            pr /= pr.sum()
+        pr[b] = 1.0 - pr.sum()
+        return int(self.rng.choice(3, p=pr))
+
+    def update(self, a, z, r):
+        pass                                 # the oracle does not learn from its own decisions
+
+
 # ============================================================================= factory
 def make(name, d, seed):
     rng = np.random.default_rng([seed, 7, sum(map(ord, name))])
@@ -272,6 +319,9 @@ def make(name, d, seed):
         return Oracle()
     if name in C.BANDITS:
         return LinearBandit(name, d, rng)
+    if name.startswith("sqcb_"):
+        model, mode = name[len("sqcb_"):].split("_")
+        return SquareCB(model, mode, rng)
     if name in C.SUPERVISED + C.RETRAINED + C.SUPERVISED_EXTRA:
         model, mode = name.split("_")
         return Supervised(model, mode, seed)

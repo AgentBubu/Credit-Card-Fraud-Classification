@@ -18,6 +18,8 @@ Commands
                                                         how often a bandit's top two actions tie
   python main.py analyze  [--figure-scenario S1 S5]     tables + Figures 1-3 (frozen models and bandits)
   python main.py analyze-retrain [--figure-scenario S1] same, adding the monthly-retrained models
+  python main.py pilot    [--pilot DIR ...]             pilot folders vs their corpus twins
+                                                        (default: every Results/pilot/*; PLAN-tree-bandit.md)
   python main.py all      [--seeds all] [--jobs 4]      everything above, in order
 
 Examples
@@ -55,7 +57,7 @@ def main():
         print(__doc__)
         return
     cmd, rest = sys.argv[1], sys.argv[2:]
-    from fcmab import analysis, analysis_retrain, checks, config, fingerprint, run, tune
+    from fcmab import analysis, analysis_retrain, checks, config, fingerprint, pilot, run, tune
 
     if cmd == "tune":
         tune.main(rest)
@@ -69,6 +71,8 @@ def main():
         analysis.main(rest)
     elif cmd in ("analyze-retrain", "analyse-retrain"):
         analysis_retrain.main(rest)
+    elif cmd == "pilot":
+        raise SystemExit(pilot.main(rest))
     elif cmd == "all":
         jobs = _opt(rest, "--jobs", [str(os.cpu_count() or 2)])
         seeds = _opt(rest, "--seeds", ["all"])

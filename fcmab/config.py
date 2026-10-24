@@ -36,13 +36,17 @@ RETRAINED = ["rf_monthly"]                      # xgb_monthly dropped: it cost 6
 SUPERVISED_EXTRA = []                            # 28 h grid and only repeated rf's conclusion
 REFERENCES = ["approve_all", "oracle"]          # not competitors: savings baseline and lower bound
 POLICIES = REFERENCES + BANDITS + SUPERVISED + RETRAINED
+# Step 2 of PLAN-tree-bandit.md: supervised oracle + non-uniform exploration. Deliberately kept
+# out of POLICIES while it is a pilot (Results/pilot-tree/), so the grid, tables and figures of
+# the 480-run corpus stay exactly as committed.
+SQUARECB = ["sqcb_rf_frozen"]
 
 #: Measured seconds per run on this machine (one core, dataset already built), from the 420-run
 #: corpus and the monthly pilot. Only used to print an ETA before a grid starts - nothing reads
 #: it for correctness, so it is fine for it to be rough.
 RUN_COST_S = {"rf_monthly": 1160.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
               "xgb_frozen": 59.0, "xgb_monthly": 360.0, "eps_greedy": 52.0,
-              "oracle": 2.5, "approve_all": 2.0}
+              "sqcb_rf_frozen": 120.0, "oracle": 2.5, "approve_all": 2.0}
 
 #: Cold build of one scenario cache, measured on this box (309 s for S1 seed 0, 352 MB on disk).
 CACHE_BUILD_S = 300.0
@@ -55,6 +59,12 @@ C_MFA = 1.0            # cost of one MFA challenge, including customer inconveni
 C_REV = 5.0            # cost of one review, including analyst time and the held payment
 MFA_BYPASS = 0.10      # share of fraudsters who get past MFA
 REWARD_SCALE = 100.0   # bandit reward = money saved vs. approving / 100
+
+# ----------------------------------------------------------------------------- SquareCB (step 2 of PLAN-tree-bandit.md)
+# Non-uniform exploration on top of a supervised oracle. Reward is US$ saved, so the gaps this
+# is scaled by are dollars: a $100 gap must explore much less than a $2 gap.
+SQCB_MU = 10.0         # exploration floor: every non-best action gets >= 1 / MU (3 actions)
+SQCB_GAMMA = 0.1       # how fast exploration dies as the expected-cost gap grows
 
 # ----------------------------------------------------------------------------- feedback model
 REVIEW_DELAY_HOURS = 24
