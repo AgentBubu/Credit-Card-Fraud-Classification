@@ -168,15 +168,23 @@ retrained forest beats both frozen models.
   because it compared them against default-parameter simulations - a gate that cries wolf is
   worse than no gate. `census()` still simulates at current defaults, so do not read its tie
   counts as describing the stored runs after a re-tune.
+- Out of scope by decision, recorded so nobody rediscovers them: `xgb_monthly` (60 runs, ~2 h,
+  `run --policies xgb_monthly --jobs 8`) to complete the family x retraining 2x2; tuning on
+  more than one 2019 slice; further runtime work - the 1-1.5 h goal is met at 63 min.
 - `RUN_COST_S` is a measured constant for *this* machine, and it is only used for the ETA
   printout - wrong values mislead nobody but the printout.
 - Cold builds are capped at 12 concurrent because this box currently has 20 GiB free (a
   `strata` process is holding 78 GiB); on an idle 112 GiB box that cap could rise.
-- The corpus fingerprints in `Results/corpus_fingerprints.json` (480 runs, regenerated after
-  the re-tune) stay the reference for any future engine change, together with
-  `python main.py check --replay N`. They are not tracked by git - back them up when they
-  change.
-- Backups: 420 runs (428 MB) and both fingerprint files in `C:\fcmab_backup\runs_20261023\`
-  (same disk as the working copy - this is protection against mistakes, not drive failure),
-  pre-retune fingerprints in `%TEMP%\corpus_fingerprints_pre-retune.json`. The grid on disk is
-  now 480 runs and is newer than that backup.
+- The corpus fingerprints are committed at `Results/corpus_fingerprints.json` (480 runs, 413 KB,
+  force-added past the `Results/*` ignore rule). They were regenerated after the re-tune and
+  are the reference for any future engine change: the diff of that file *is* the answer to "did
+  the engine change?". Keeping it outside git meant the reference existed on one disk.
+- Replay gate, current corpus: both `rf_monthly` runs replayed byte-identical - the first time
+  the monthly (retraining) path has ever round-tripped - and a random 10-run sample across
+  policies reports 0 differ. `python main.py check --replay N` is trustworthy again.
+- Sizing `--jobs` after the re-tune: free RAM here is ~19 GiB, so `--jobs 8`. Free failed runs
+  are never written, so a re-run of the same command is the whole recovery.
+- Backups: `C:\fcmab_backup\runs_20261025\` holds all 480 runs (629 MB). Same disk as the
+  working copy, so it protects against mistakes, not against drive failure. The older
+  `runs_20261023\` (420 runs) and the pre-retune fingerprints
+  (`%TEMP%\corpus_fingerprints_pre-retune.json`) are kept for comparison.
