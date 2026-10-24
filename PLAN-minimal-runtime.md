@@ -14,7 +14,7 @@ Everything below was measured on this box (56 cores, 112 GiB RAM), not estimated
 | stored corpus, 420 runs (6 scenarios x 10 seeds x 7 policies) | **6.62 h** of CPU |
 | per policy share of that | rf_frozen 28.8%, lints 21.9%, linucb 20.3%, xgb_frozen 14.9%, eps_greedy 13.2%, references 1% |
 | inside one rf_frozen run | model scoring 48%, the 2019 fit ~49%, the day-by-day loop ~3% |
-| one rf_monthly run | ~830-900 s (11 retrains), vs 114 s for rf_frozen |
+| one rf_monthly run | **1,158 s** (11 retrains), vs 114 s for rf_frozen; 830 s only when the box is otherwise idle |
 | cold build of one scenario cache | **309 s**, 352 MB on disk |
 | worker memory per run | **0.17-0.35 GiB** (feature matrices are memory-mapped) |
 | throughput already proven | 420 full re-simulations in ~40 min at 14 concurrent workers |
@@ -69,17 +69,19 @@ No new abstractions, no new modules: one helper, two constants, one flag.
 
 ## The budget
 
-CPU is 21.6 h for the complete grid (480 runs = 8 policies x 60 scenario-seed cells: 6.62 h
-as stored plus 15 h of rf_monthly). Workers take ~0.3 GiB each and are single-threaded
+CPU is 25.9 h for the complete grid (480 runs = 8 policies x 60 scenario-seed cells: 6.62 h
+as stored plus 19.3 h of rf_monthly at 1,158 s a run). Workers take ~0.3 GiB each and are
+single-threaded
 (`n_jobs=1`), so wall clock is CPU divided by `--jobs`, with headroom up to the 56 cores.
 
 | situation | command | expected wall |
 |---|---|---|
-| this box, caches and 420 runs on disk | `python main.py all --jobs 28` | ~35 min (60 rf_monthly runs left) |
-| fresh clone, warm nothing | `python main.py all --jobs 28` | ~25 min caches + ~46 min runs + ~3 min analyse = **~74 min** |
-| same, fewer cores | `python main.py all --jobs 14` | ~25 min + ~93 min = over budget |
+| this box, caches and 420 runs on disk | `python main.py all --jobs 28` | ~44 min (60 rf_monthly runs left) |
+| fresh clone, warm nothing | `python main.py all --jobs 28` | ~25 min caches + ~55 min runs + ~3 min analyse = **~83 min** |
+| fresh clone, more cores | `python main.py all --jobs 36` | ~25 min + ~43 min + ~3 min = ~71 min |
+| same, fewer cores | `python main.py all --jobs 14` | ~25 min + ~111 min = over budget |
 | quick dev loop | `python main.py run --scenarios S1 --seeds 0 --jobs 4` | minutes |
-| if 10 seeds must be trimmed | `--seeds 0 1 2 3 4` | 10.8 h CPU, ~23 min at 28 jobs |
+| if 10 seeds must be trimmed | `--seeds 0 1 2 3 4` | 13 h CPU, ~28 min at 28 jobs |
 
 **Decision: keep 10 seeds.** It fits the budget, and cutting seeds is the one lever that
 weakens the statistics; it stays available as `--seeds` rather than being the default.
@@ -88,9 +90,10 @@ Dropping `xgb_monthly` is a scope change, not a speed trick: this branch can no 
 
 ## Not done, and what to watch
 
-- `xgb_monthly` runs already deleted from scope but the tables/figures were never checked
-  with only one retrained model on a *full* grid; `analyze-retrain` was verified to tolerate
-  zero monthly runs, not one.
+- `xgb_monthly` is out of scope, and the tables were checked only with zero and one retrained
+  run present (`analyze-retrain` prints the row with blank error bars and no crash). The
+  figures for the full 10-seed monthly set are still unmade, as are 59 of the 60 rf_monthly
+  runs - which is what the ~44 min above buys.
 - `RUN_COST_S` is a measured constant for *this* machine, and it is only used for the ETA
   printout - wrong values mislead nobody but the printout.
 - Cold builds are capped at 12 concurrent because this box currently has 20 GiB free (a

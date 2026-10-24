@@ -40,7 +40,7 @@ POLICIES = REFERENCES + BANDITS + SUPERVISED + RETRAINED
 #: Measured seconds per run on this machine (one core, dataset already built), from the 420-run
 #: corpus and the monthly pilot. Only used to print an ETA before a grid starts - nothing reads
 #: it for correctness, so it is fine for it to be rough.
-RUN_COST_S = {"rf_monthly": 900.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
+RUN_COST_S = {"rf_monthly": 1160.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
               "xgb_frozen": 59.0, "xgb_monthly": 360.0, "eps_greedy": 52.0,
               "oracle": 2.5, "approve_all": 2.0}
 
