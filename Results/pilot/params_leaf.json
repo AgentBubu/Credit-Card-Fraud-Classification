@@ -1,0 +1,7 @@
+{
+ "WARM_N": 600000,
+ "EPSILON": 0.001,
+ "ALPHA": 0.03,
+ "TS_SCALE": 0.03,
+ "USE_LEAF_FEATURES": true
+}

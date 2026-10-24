@@ -237,3 +237,64 @@ stays out (decided). No claim of algorithmic novelty. Nothing pushed to `main`.
 - Whether a per-run `.npz` under `Results/runs/` stores per-transaction actions. If it does, the
   "bandits challenge by amount decile" check behind section 3 is a script over existing
   artifacts rather than a re-run - worth confirming before step 1.
+  **Confirmed afterwards:** the `.npz` holds `row, ts, amt, y, pattern, burst, action, bypass,
+  cost, daily`, so that check needs no re-run.
+
+## 8. Steps 0-2 as run (2026-10-25), against the gates written in section 4
+
+Scope: S0/S1 x seeds 0-2, six cells per comparison. Every pilot run went to its own folder under
+`Results/pilot/` (via `FCMAB_RESULTS`), so the 480-run corpus, its tables and its figures were
+never written to; `python main.py check` still reports 480 runs, 0 problems. The comparison is
+per cell, with `python main.py pilot` pairing each pilot run with the corpus run that differs from
+it in exactly one setting. `Results/pilot/report.txt` is that command's output, and
+`Results/pilot/run_*.sh` plus `params_*.json` are what produced it.
+
+**Step 0 - measured.** `sqcb_rf_frozen` 118-165 s, `sqcb_rf_monthly` 859 s, a leaf-features bandit
+1,041 s alone and ~1,400 s at `--jobs 4` (against 78-146 s with leaf features off: the context goes
+from 42 to ~363 columns and both the warm-start transform and the per-row gather pay for it). Peak
+with leaf features at `--jobs 4`: 2.6 GB total working set with **22.9 GB of commit still free**,
+which explains the old `--jobs 28` commit exhaustion (~28 workers x ~1.9 GB) and says 8 would fit.
+Everything below ran at `--jobs 4`.
+
+**Step 1 - PASS, at three times the margin the gate asked for.** Same tuned parameters
+(`WARM_N` 600000, `EPSILON` 0.001, `ALPHA`/`TS_SCALE` 0.03), only `USE_LEAF_FEATURES` flipped:
+
+| policy | leaf off | leaf on | paired difference | cells better |
+|---|---|---|---|---|
+| eps_greedy | 623,620 | 207,053 | -416,567 (-67%) | 6/6 |
+| linucb | 617,993 | 275,612 | -342,381 (-55%) | 6/6 |
+
+The decomposition matters more than the total. On these six cells the leaf bandit's fraud loss
+(35.1k) equals `rf_monthly`'s (35.9k) and is half either frozen model's (76-77k), while its
+intervention fees are 172k against `rf_monthly`'s 21k, and its friction is 15% against 1.1%. In
+other words the representation was the failure and the detection was never the problem; what is
+left is the *decision* - how often the policy believes a $1 challenge is worth making.
+
+**Step 2 - FAIL as a win, worth keeping as a price curve.** SquareCB on the calibrated forest,
+`SQCB_GAMMA` 0.1, paired with its own greedy twin (`rf_frozen` frozen / `rf_monthly` monthly):
+
+| oracle | MU | friction (exploration volume) | TFL vs twin | cells better |
+|---|---|---|---|---|
+| frozen | 10 | 20.1% | +519% | 0/6 |
+| frozen | 30 | 7.5% | +179% | 0/6 |
+| frozen | 100 | 3.0% | +54% | 0/6 |
+| monthly | 100 | 3.1% | +100% | 0/6 (Wilcoxon p = 0.031, the n = 6 floor) |
+
+The price is close to linear in `1/MU` and it is dominated by the flat $5 review fee: for a
+legitimate transaction the three expected costs sit within a few dollars of each other, so
+"explore where the model is nearly indifferent" means "explore everywhere", and what it buys is
+review. Monthly retraining did turn part of the exploration into detection (+0.7 pp of fraud
+stopped) but at twice the TFL. Deviation from the wording of step 2, recorded: it asks for
+`monthly = True`, and the plan here was to run the frozen variant first because it is 10x cheaper
+and isolates the exploration axis from the retraining axis, then the monthly variant at the
+cheapest point of the curve. MU is the knob that sets exploration volume (1/MU per non-best
+action); GAMMA only decides how fast it dies as the dollar gap grows, and at these cost scales a
+$5 gap is already small next to MU.
+
+**Consequence for the ladder.** Step 2 stops at the pilot, as section 4 prescribes for a loss.
+Step 1 passed its gate, so the plan's next item is its 60-cell grid: ~23 h CPU for one policy (~10 h
+at `--jobs 8`, ~20 h at the measured-safe `--jobs 4`), ~70 h for all three bandits, unless
+`transform`/`act` are made sparse-first first - the per-row `Ainv[:, nz][:, :, nz]` gather over 363
+columns is what the 13x runtime pays for, and it is avoidable. Step 3 (`tree_ucb`) is unchanged in
+the plan and now has a stronger reason to be tried: the leaf features prove that tree structure is
+what the linear policy was missing.
