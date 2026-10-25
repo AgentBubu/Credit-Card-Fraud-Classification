@@ -398,12 +398,30 @@ intervention fees (128k MFA + 26k review) against 6.5% fraud loss (10.8k).
 
 Section 9 leaves a bandit that is 3.4x above `rf_monthly` with the best context this family can get,
 and 93.5% of that gap is intervention fees. Reading the stored logs says the fees are being spent in
-the wrong place. The cost matrix (`C_MFA` $1, `C_REV` $5, `MFA_BYPASS` 0.10, chargeback probability
-0.9) implies a two-threshold rule on expected fraud dollars `x = P(fraud) x amount`:
+the wrong place. Rewards are "money saved versus approving, / 100" (`counterfactual_rewards`), and the
+simulator charges an approved fraud the **full** amount, so `approve` scores 0 by construction and the
+optimal rule on expected fraud dollars `x = P(fraud) x amount` is:
 
 ```
-approve below $1.25   |   MFA $1.25 - $40   |   review above $40
+E[MFA]   = 0.9 x - C_MFA        E[REVIEW] = x - C_REV        E[approve] = 0
+intervene (either arm) above x = C_MFA / (1 - MFA_BYPASS) = $1.11
+review rather than MFA above x = (C_REV - C_MFA) / MFA_BYPASS = $40.00
 ```
+
+which is the same rule `Supervised.act` computes directly from its cost vector
+`[p*amt, C_MFA + MFA_BYPASS*p*amt, C_REV]`.
+
+**Two suspicious things were checked and are not the cause.** (1) Chargebacks are pushed onto the
+label heap with `a_k, z_k, r_k = 0, None, 0.0` and the delivery step updates the policy only for
+`kind == "review"`, so a bandit is never *told* that an approved fraud cost money. That looks like an
+omission and is not: under the saved-versus-approving convention the target for `approve` is
+identically 0, and feeding the chargeback through `update()` would charge the same loss twice - once
+on `approve` and once inside the MFA/review rewards, which are already defined relative to approving.
+(2) `mean[approve] == 0` for the whole run is therefore correct, not a stuck arm. What *is* true is
+that with three free arms the MFA-versus-review discrimination has to be recovered from a reward
+difference of order `0.1 x` sitting on top of amount-scale variance (a single $2,000 fraud differs by
+$1,996 between the arms depending on one Bernoulli bypass draw), while the analytic rule reads it off
+`C_MFA`, `C_REV` and `MFA_BYPASS` for free.
 
 What the runs actually do (S1 seed0, logged stream, $1.32M of fraud):
 
@@ -449,3 +467,63 @@ retrained forests is mostly the decision rule, not the value function. Friction 
 TFL: the estimator is the binding constraint, and the honest report is that a better context or a
 calibrated probability is required, which is the negative half of the same finding. Nothing: the
 margin is not the lever, and the ladder stops here rather than buying a 60-cell grid of it.
+
+### 10.1 D0 result: D1 is dead, and the reason is worse than a bad threshold
+
+D0 ran on `S1` seed 0 with the run's own parameter snapshot (`EPSILON` 0.001), reproducing it exactly:
+925,317 logged decisions, TFL 612,886.9 against a stored 612,886.9, so the probe did not perturb the
+run. `mean[approve]` was 0.0 to the last bit on every row, as section 10 predicts.
+
+The policy prefers an intervention on **38.35%** of rows. Intervening genuinely pays on **0.24%** of
+them. But the interesting part is the scale of what it is comparing:
+
+| amount | rows | fraud rate | estimated advantage p50 / p99 / p99.9 | true advantage (mean) |
+|---|---|---|---|---|
+| $0-50 | 480,968 | 0.22% | -0.02 / +0.15 / +0.30 | -$0.96 |
+| $50-250 | 420,484 | 0.11% | -0.02 / +0.52 / +0.75 | -$0.84 |
+| $250+ | 23,865 | 2.88% | +0.20 / +1.31 / +1.67 | +$16.82 |
+
+Spearman(estimated advantage, amount) is +0.206: weakly ordered, so the model is not blind to amount.
+But every estimate in the run lies between **-$0.71 and +$2.13**, while the true advantage reaches
+$1,249 on a single row and averages +$36.86 above $1,000. In the band where the money is, the 99.9th
+percentile of the estimate is $1.67 against a true band mean of $16.82 - **one tenth of the signal, and
+none of the range**. The estimate is not mis-scaled by a constant, it is *compressed*: a linear model in
+standardised `log_amt` cannot express `p(x) x amount`, which is multiplicative, so ridge shrinks every
+arm value toward the global mean.
+
+Applying a margin to the recorded estimates shows there is nothing for a margin to work with:
+
+| DELTA | % intervene | MFA | REVIEW | fees | fraud loss | predicted TFL |
+|---|---|---|---|---|---|---|
+| $0 | 38.35% | 313,135 | 41,760 | 521,935 | 88,497 | 610,432 |
+| $1 | 0.09% | 0 | 873 | 4,365 | 339,322 | 343,687 |
+| $2 and above | 0.00% | 0 | 1 | 5 | 516,562 | 516,567 |
+
+At $0 the policy drowns in noise just above zero; at $1 it stops intervening almost entirely and TFL is
+all fraud loss. There is no plateau, because there is no separation between "worth reviewing" and
+"$12 coffee" in the estimate - the populations are separated in *amount* (true advantage $24 vs -$0.95)
+and the estimator throws that away. (The screen itself is sound: its $0 row predicts 610,432 against
+the run's actual 612,887, 0.4% off.)
+
+So the branch in section 10 resolves to neither of its two named outcomes: the ordering is not flat and
+the scaling is not a constant factor, and **D1 (the margin) cannot work on any parameter value.** D2 is
+the only route, and D0 says exactly what it has to fix - the *quantity* being estimated:
+
+- estimate one thing, **expected fraud dollars** `x = P(fraud) x amount`, as a single ridge regression
+  on the target `y x amount / REWARD_SCALE`, updated whenever a label arrives (review result,
+  chargeback, blocked card) - the same partial-label situation the forests already train under;
+- take the action from the cost matrix, `review above $40`, `MFA above $1.11`, approve below, with the
+  thresholds computed from `C_MFA`, `C_REV` and `MFA_BYPASS`, never tuned.
+
+The reward scale is unchanged, the features are unchanged, and two of the three arms disappear.
+This also explains a result already in the corpus: the leaf arms add columns
+`leaf_onehot` *and* `leaf_onehot x amount` (`LinearBandit.transform`), which is an
+amount-by-segment interaction - the one piece of multiplicative structure the leaf variant had. That
+is very likely why turning it on halved TFL, and it is the same mechanism D2 supplies directly.
+
+**The gate transfers to D2 unchanged:** 6 pilot cells, friction <= 5%, TFL <= 140k, and
+`fraud_stopped` not below the leaf-on value. Realistic target: `rf_monthly` (69.5k, calibrated
+probability plus this same analytic rule) sits at one end and the leaf bandit (234.9k) at the other,
+with `oracle` (5.4k) as the ceiling. If a bandit that estimates one well-scaled quantity lands near
+`rf_monthly`, the finding is that most of the published bandit-versus-forest gap here is the
+decision variable, not the learning rule.
