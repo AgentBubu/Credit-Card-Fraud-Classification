@@ -527,3 +527,107 @@ probability plus this same analytic rule) sits at one end and the leaf bandit (2
 with `oracle` (5.4k) as the ceiling. If a bandit that estimates one well-scaled quantity lands near
 `rf_monthly`, the finding is that most of the published bandit-versus-forest gap here is the
 decision variable, not the learning rule.
+
+## 11. D2 measured: the level is wrong, and that is the finding (2026-10-25)
+
+`dollar_rule`: one ridge regression per row, target the dollars the row was worth
+(`y * amount / REWARD_SCALE`), action read off the cost matrix (intervene above
+`C_MFA / (1 - MFA_BYPASS)` = $1.11, review above `(C_REV - C_MFA) / MFA_BYPASS` = $40; thresholds are
+computed from the constants, never typed). Labels arrive only through the policy's own actions - a
+registered context plus a positive discovery - so it is bandit feedback, not supervision. The
+simulator now carries a row's context to the place where its fraudulence is learned, for that policy
+only; every other policy's delayed events are byte-identical (`wants_labels`).
+
+6 cells (S1/S3/S5 x seeds 0,1) at the corpus parameters, paired against the corpus `eps_greedy`:
+
+| metric | dollar_rule | eps_greedy | paired difference |
+|---|---|---|---|
+| TFL | 515,535 | 563,060 | **-8.4%**, 6/6 cells better, p = 0.031 (the floor at n = 6) |
+| review cost | 79k | 182k | -56.6% |
+| MFA cost | 380k | 317k | **+19.7%** |
+| friction | 42.8% | 38.2% | **+11.9%** |
+| fraud stopped | 74.8% | 71.3% | +4.9% |
+
+**Gate: not met.** It asks for friction <= 5% and TFL <= 140k; 515k is 7.5x `rf_monthly` (69.5k) and
+2.6x the frozen forests. The saving versus `eps_greedy` is almost entirely "review 57% less"; it
+spends it back on MFA.
+
+The measurement that matters is the calibration, not the TFL
+(`python -m fcmab.probe_decisions S1 0 dollar_rule Results/pilot/dollar600/runs/S1/seed0/dollar_rule`):
+
+- mean x_hat **$1.78** against **$0.41** realised: the level is 4.3x too high, so the cost matrix's
+  own $1.11 cut-off fires on 43% of traffic;
+- x_hat is **negative on 43% of rows**, down to -$14. An expected loss cannot be negative: a
+  least-squares fit on a heavy-tailed non-negative target leaves the valid range wherever no large
+  fraud pins it down;
+- the ranking is sharp only at the very top. Rows above $40 (1.7% of traffic) hold **64.5% of the
+  fraud dollars** at a 2.3% fraud rate; below that the order is flat and then inverted - the fraud
+  rate *rises* as x_hat falls from decile 2 to decile 10;
+- re-reading the thresholds on that same estimate (static screen, no feedback loop, so it screens
+  rather than proves): $20/$200 would predict 5.8% friction and $183k; $50/$500, 0.9% and $196k. The
+  cost matrix is not the obstacle - an uncalibrated level is.
+
+Also found and fixed while making the comparison honest: `run --params <missing file>` used to run
+the whole grid on the defaults in silence. The first D2 number quoted in this session (-34%) was
+produced that way, against a baseline at 10x less exploration, and is void; -8.4% is the real one.
+`config.load_overrides(path, required=True)` now raises, and an explicit `--results` no longer hides
+the default `--params` lookup.
+
+**Next variant, written before running it.** The amount must not be *estimated* at all: it is known
+exactly at decision time (column 0 of the context), so what is learned is p(x), which is bounded, and
+the decision quantity is `p_hat * amount`. Same machinery, same thresholds, one change of target.
+Pass gate, unchanged from section 10: friction <= 5%, TFL <= 140k, `fraud_stopped` not below the
+leaf-on value. If it beats `eps_greedy` and both frozen forests at <= 5% friction but misses 140k,
+that is still the finding (the gap is the decision variable, not the learning rule) - report it and
+stop; do not hand-tune a threshold to make a number, because the thresholds are the cost matrix.
+
+## 12. D3 measured: the decision variable is worth 61%; the residual gap is estimator quality (2026-10-25)
+
+`prob_rule` = the same machinery with the target changed from dollars to `y`, the decision quantity
+being `p_hat * amount` (the amount is read out of the context, never estimated). Same 6 cells, same
+corpus parameters, same cost-matrix thresholds.
+
+| compared against | prob_rule | the other | paired | cells better | Wilcoxon p |
+|---|---|---|---|---|---|
+| `eps_greedy` (its own leafless twin) | 219,400 | 563,060 | **-61.0%** | **6/6** | 0.031 (the floor at n = 6) |
+| `eps_greedy` + tree leaves (section 9's best bandit) | 219,400 | 241,325 | -9.1% | 4/6 | 0.312 |
+| `rf_frozen` | 219,400 | 183,731 | +19.4% | 2/6 | 0.219 |
+| `rf_monthly` | 219,400 | 75,978 | +188.8% | **0/6** | 0.031 |
+
+Friction 14.8% (from 42.8% for D2 and 38.2% for the twin), reviews 92% down, MFA 58% down,
+`fraud_stopped` 60.4% - below the twin's 71.3%, because it intervenes on a third as much traffic.
+
+**Gate: not met** (needs friction <= 5% and TFL <= 140k). Direction right, magnitude short: section 10
+hoped it would land near `rf_monthly` (76k here); it lands in the frozen-forest league instead.
+
+Calibration of the new estimate, same probe:
+
+- mean x_hat **$0.85** against **$0.35** realised - 2.4x, down from 4.3x with the dollars target;
+- still negative in the tail, but -$1.7 instead of -$14: same failure mode, a fifth of the size;
+- decile 1 holds **71% of the fraud dollars** at a 0.46% fraud rate; below decile 3 the ordering is
+  flat and then inverted again (deciles 8-10 have higher fraud rates than decile 3). **The level bias
+  shrank with the target's tail; the ordering did not move.**
+- the static screen predicted this cell's measured TFL well ($239k predicted, $242k run), which is
+  what makes its other rows readable: $5/$50 -> 4.2% friction and $160k, $20/$200 -> 0.7% and $144k.
+  So a threshold-tuned version of this estimator is a ~$144-160k policy in a cell where `rf_frozen`
+  costs $170k and `rf_monthly` $83k. Tuning the thresholds by hand is what section 11 forbids - they
+  are the cost matrix, not a hyperparameter - so the number was not bought.
+
+**Two findings worth keeping.**
+
+1. The decision variable explains most of the published bandit-versus-forest gap here: -61% from one
+   change of what is estimated, 6/6 cells, with the thresholds untouched.
+2. The tree-leaf features of section 9 are not needed to get there: `prob_rule` matches the leaf-on
+   bandit (-9.1%, p = 0.312, not distinguishable) in **54 s per cell instead of 1,230 s** - 23x
+   cheaper, no forest in the loop, no leaf-count drift to caveat.
+
+**The ladder stops here.** With the decision variable fixed, what is left is the quality of a linear
+p estimated from bandit feedback (level 2.4x high, tail ordering inverted) and the label economics
+`rf_monthly` exploits: it retrains monthly on every row the bank believes it has, including each
+approved row as a negative, and applies a calibrated probability to the same analytic rule. A bandit
+that has neither the calibration nor the negatives cannot close that by changing its arm values.
+
+Not verified in this pass: the calibration is one cell (S1/seed0) - the level claim needs an S5
+repetition; 6 cells and 2 seeds per scenario, so -61% is robust in sign (6/6) and not in size
+(p = 0.031 is the floor); `linucb` / `lints` never got the new estimator; `prob_rule` with leaf
+features ON is untested; `fraud_stopped` against the leaf-on bandit on these cells was not measured.

@@ -42,13 +42,18 @@ POLICIES = REFERENCES + BANDITS + SUPERVISED + RETRAINED
 # (that oracle cannot use what it explores for); _monthly is the version where exploration can
 # pay, because the retraining step sees the labels the explored actions produced.
 SQUARECB = ["sqcb_rf_frozen", "sqcb_rf_monthly"]
+# D2 and D3 of PLAN-tree-bandit.md sections 10-11: one ridge regression per row and the action read
+# off the cost matrix - dollar_rule estimates the dollars the row was worth, prob_rule estimates p and
+# multiplies by the known amount. Same treatment as SQUARECB: out of POLICIES while they are pilots,
+# so the grid, tables and figures of the 480-run corpus stay exactly as committed.
+DOLLAR_RULE = ["dollar_rule", "prob_rule"]
 
 #: Measured seconds per run on this machine (one core, dataset already built), from the 420-run
 #: corpus and the monthly pilot. Only used to print an ETA before a grid starts - nothing reads
 #: it for correctness, so it is fine for it to be rough.
 RUN_COST_S = {"rf_monthly": 1160.0, "rf_frozen": 114.0, "lints": 87.0, "linucb": 80.0,
               "xgb_frozen": 59.0, "xgb_monthly": 360.0, "eps_greedy": 52.0,
-              "sqcb_rf_frozen": 120.0, "sqcb_rf_monthly": 1262.0,
+              "sqcb_rf_frozen": 120.0, "sqcb_rf_monthly": 1262.0, "dollar_rule": 90.0, "prob_rule": 60.0,
               "oracle": 2.5, "approve_all": 2.0}
 
 #: Cold build of one scenario cache, measured on this box (309 s for S1 seed 0, 352 MB on disk).
@@ -119,9 +124,16 @@ def apply(params):
     return params
 
 
-def load_overrides(path):
-    """Apply a JSON file of {NAME: value} overrides (e.g. tuned bandit parameters)."""
+def load_overrides(path, required=False):
+    """Apply a JSON file of {NAME: value} overrides (e.g. tuned bandit parameters).
+
+    A missing file is only silent when it is the default one (Results/tuned_params.json need not
+    exist). An explicit --params that does not exist raises: a typo used to run the whole grid on the
+    defaults, at 10x the exploration rate and a twelfth of the warm start, and nothing complained.
+    """
     if not path or not os.path.exists(path):
+        if required:
+            raise FileNotFoundError(f"--params {path}: no such file (defaults would be used instead)")
         return {}
     with open(path, encoding="utf-8") as f:
         return apply(json.load(f))

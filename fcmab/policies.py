@@ -165,12 +165,16 @@ class LinearBandit(Policy):
             return
         idx = rng.choice(n, m, replace=False)
         Z = self.transform(X[idx])
-        R = counterfactual_rewards(y[idx], amt[idx], rng)
+        R = self.warm_rewards(y[idx], amt[idx], rng)
         Ainv = np.linalg.inv(Z.T @ Z + C.RIDGE_LAMBDA * np.eye(self.d))
         for a in range(3):
             self.Ainv[a] = Ainv
             self.b[a] = Z.T @ R[:, a]
             self.theta[a] = Ainv @ self.b[a]
+
+    def warm_rewards(self, y, amt, rng):
+        """Warm-start targets, one column per action; overridden by DollarRule."""
+        return counterfactual_rewards(y, amt, rng)
 
     def act(self, z):
         nz = np.flatnonzero(z)                     # z is sparse: use only its non-zero entries
@@ -209,6 +213,88 @@ class LinearBandit(Policy):
         Ai -= np.outer(Az, Az) / (1.0 + z[nz] @ Az[nz])          # Sherman-Morrison rank-one update
         self.b[a, nz] += r * z[nz]
         self.theta[a] = Ai @ self.b[a]
+
+
+# ============================================================================= dollar rule
+class DollarRule(LinearBandit):
+    """One ridge regression on expected fraud dollars; the action comes from the cost matrix.
+
+    D2 of PLAN-tree-bandit.md section 10. With three free arm-value regressions the estimated
+    advantage of intervening lives inside -$0.71..+$2.13 while the true advantage reaches $1,249,
+    because a linear model in standardised log_amt cannot express p(x) x amount: it must trade the
+    amount ramp against the hour pattern and cannot have both. So estimate that product directly -
+    target y x amount / REWARD_SCALE, the units every bandit reward already uses - and let the cost
+    matrix, which is agreed and never tuned, pick the action:
+
+        approve   below  C_MFA / (1 - MFA_BYPASS)                = $1.11 of expected fraud dollars
+        MFA       between that and (C_REV - C_MFA) / MFA_BYPASS  = $40
+        review    above  $40
+
+    Labels arrive the way they do for every other policy: an action registers its context through
+    update(), and a transaction that turns out to be fraudulent tops its target up through label().
+    An approved transaction that is never reported keeps target 0, which is the same information the
+    retrained forests are given (the simulator's `obs` column). No label is ever seen for an action
+    that was not taken, so this is bandit feedback, not supervision.
+    """
+    name = "dollar_rule"
+    wants_labels = True
+    #: False: the target is the dollars the row was worth. True (ProbRule): the target is y itself.
+    target_prob = False
+
+    def __init__(self, kind, d, rng):
+        super().__init__(kind, d, rng)
+        #: cut-offs in dollars of expected fraud loss, straight out of the cost matrix
+        self.lo = C.C_MFA / (1.0 - C.MFA_BYPASS)
+        self.hi = (C.C_REV - C.C_MFA) / C.MFA_BYPASS
+
+    def warm_rewards(self, y, amt, rng):
+        t = y.astype(np.float64) if self.target_prob else y * amt / C.REWARD_SCALE
+        return np.repeat(t[:, None], 3, axis=1)  # the three slots hold the one quantity; only [0] is read
+
+    def dollars(self, z, raw):
+        """Raw regression output -> dollars of expected fraud loss. A probability is multiplied by
+        the amount, which is known exactly at decision time; a dollars target already is one."""
+        return raw * self.amount(z) if self.target_prob else raw * C.REWARD_SCALE
+
+    def target(self, z):
+        """What a labelled row contributes to b, in the units the regression works in."""
+        return 1.0 if self.target_prob else self.amount(z) / C.REWARD_SCALE
+
+    def act(self, z):
+        nz = np.flatnonzero(z)
+        x = self.dollars(z, float(self.theta[0, nz] @ z[nz]))    # estimated fraud dollars at stake
+        if self.rng.random() < C.EPSILON:                          # explore, as the other bandits do
+            return int(self.rng.integers(3))
+        return C.APPROVE if x < self.lo else (C.MFA if x < self.hi else C.REVIEW)
+
+    def update(self, a, z, r):
+        """Register this context in the design; the target comes from label(), so r is unused."""
+        Ai = self.Ainv[0]
+        nz = np.flatnonzero(z)
+        zn = z[nz]
+        Az = Ai[:, nz] @ zn
+        Ai -= np.outer(Az, Az) / (1.0 + zn @ Az)
+        self.theta[0] = Ai @ self.b[0]
+
+    def label(self, z):
+        """This transaction turned out to be fraudulent: top its target up.
+        The amount comes back out of the context exactly (column 0 is standardised log(1 + amount)),
+        so the simulator does not have to carry it to the place where the label is learned."""
+        nz = np.flatnonzero(z)
+        self.b[0, nz] += self.target(z) * z[nz]
+        self.theta[0] = self.Ainv[0] @ self.b[0]
+
+    def amount(self, z):
+        return float(np.expm1(z[0] * self.sd[0] + self.mu[0]))
+
+
+class ProbRule(DollarRule):
+    """D3 of PLAN-tree-bandit.md section 11: learn p(x), which is bounded, not the dollars, which are
+    heavy-tailed. The amount is not estimated at all - it is known at decision time - so the decision
+    quantity is p_hat * amount and the same cost-matrix thresholds apply. Section 11 measured the
+    dollars target at a level 4.3x too high and negative on 43% of rows; this is that diagnosis."""
+    name = "prob_rule"
+    target_prob = True
 
 
 # ============================================================================= supervised
@@ -317,6 +403,10 @@ def make(name, d, seed):
         return ApproveAll()
     if name == "oracle":
         return Oracle()
+    if name == "dollar_rule":
+        return DollarRule(name, d, rng)
+    if name == "prob_rule":
+        return ProbRule(name, d, rng)
     if name in C.BANDITS:
         return LinearBandit(name, d, rng)
     if name.startswith("sqcb_"):

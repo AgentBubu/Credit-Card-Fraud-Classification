@@ -169,6 +169,10 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
 
     stream = (AdversarialStream(d, t0, t1, seed) if scenario == "S5" else StaticStream(d, t0, t1))
     is_bandit = pol.is_bandit
+    # A policy that learns what a transaction was worth (DollarRule) needs the context of a row at the
+    # moment its fraudulence is discovered, so the delayed events have to carry it. Every other policy
+    # keeps z_k = None and the events byte-identical, which is what the corpus fingerprints prove.
+    wants_labels = getattr(pol, "wants_labels", False)
     C_MFA, C_REV, SCALE = C.C_MFA, C.C_REV, C.REWARD_SCALE
     APPROVE, MFA, REVIEW, DECLINED = C.APPROVE, C.MFA, C.REVIEW, C.DECLINED
     n_retrain = 0
@@ -203,6 +207,10 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
                         fraud_known(k, t)
                     if kind == "review" and is_bandit:
                         pol.update(a_k, z_k, r_k)
+                        if wants_labels and y[k] == 1:
+                            pol.label(z_k)
+                    elif wants_labels:                 # chargeback: an approved/MFA-bypassed fraud surfaced
+                        pol.label(z_k)
                 fraud = y[i] == 1
                 a_i = amt[i]
                 if fraud:
@@ -222,7 +230,8 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
                     if fraud:
                         st[0] += a_i
                         if report_draw[i]:
-                            heapq.heappush(heap, (t + cb_delay[i], seq, "chargeback", i, 0, None, 0.0)); seq += 1
+                            heapq.heappush(heap, (t + cb_delay[i], seq, "chargeback", i, 0,
+                                                  Z[j].copy() if wants_labels else None, 0.0)); seq += 1
                     if is_bandit:
                         pol.update(a, Z[j], r)
                 elif a == MFA:
@@ -232,12 +241,15 @@ def run(scenario, seed, policy_name, d=None, test_start=None, test_end=None, his
                     if fraud and not byp:
                         obs[i] = 1
                         fraud_known(i, t)
+                        if wants_labels:
+                            pol.label(Z[j])            # caught: known now, not in 48 h
                     else:
                         obs[i] = 0
                         if byp:
                             st[0] += a_i
                             if report_draw[i]:
-                                heapq.heappush(heap, (t + cb_delay[i], seq, "chargeback", i, 0, None, 0.0)); seq += 1
+                                heapq.heappush(heap, (t + cb_delay[i], seq, "chargeback", i, 0,
+                                                      Z[j].copy() if wants_labels else None, 0.0)); seq += 1
                     if is_bandit:
                         pol.update(a, Z[j], r)
                 else:  # REVIEW

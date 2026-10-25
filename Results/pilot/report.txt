@@ -1,4 +1,31 @@
 
+=== pilot/dollar: dollar_rule vs eps_greedy (1 cells: S1/seed0) ===
+metric                      pilot         twin    paired diff      rel
+tfl                       404,094     612,887    -2.088e+05  -34.1%
+fraud_loss                 88,871      89,649        -777.8   -0.9%
+mfa_cost                  283,568     313,133    -2.956e+04   -9.4%
+review_cost                31,655     210,105    -1.784e+05  -84.9%
+friction_rate            31.3491%    38.3731%      -0.07024  -18.3%
+fraud_stopped               72.3%       70.4%       0.01896    2.7%
+mfa_per_day                 776.9       857.9           -81   -9.4%
+reviews_per_day              17.3       115.1        -97.78  -84.9%
+seconds                        50          92         -42.7  -46.3%
+paired TFL difference: -208,793 per cell (-34.1% of the twin, median cell -34.1%), 1/1 cells better, worst cell -208,793
+
+=== pilot/dollar600: dollar_rule vs eps_greedy (6 cells: S1/seed0, S1/seed1, S3/seed0, S3/seed1, S5/seed0, S5/seed1) ===
+metric                      pilot         twin    paired diff      rel
+tfl                       515,535     563,060    -4.752e+04   -8.4%
+fraud_loss                 56,474      63,254        -6,780  -10.7%
+mfa_cost                  379,948     317,353      6.26e+04   19.7%
+review_cost                79,113     182,453    -1.033e+05  -56.6%
+friction_rate            42.7999%    38.2372%       0.04563   11.9%
+fraud_stopped               74.8%       71.3%       0.03494    4.9%
+mfa_per_day                1039.1       867.9         171.2   19.7%
+reviews_per_day              43.3        99.8        -56.53  -56.6%
+seconds                        53          80        -27.03  -33.6%
+paired TFL difference: -47,525 per cell (-8.4% of the twin, median cell -9.3%), 6/6 cells better, worst cell -20,477
+Wilcoxon signed-rank p = 0.031 (n = 6, so the smallest reportable p is 0.031 - never call this strong)
+
 === pilot/leaf: eps_greedy vs eps_greedy (6 cells: S0/seed0, S0/seed1, S0/seed2, S1/seed0, S1/seed1, S1/seed2) ===
 metric                      pilot         twin    paired diff      rel
 tfl                       207,053     623,620    -4.166e+05  -66.8%
@@ -27,6 +54,21 @@ reviews_per_day              30.7       146.7        -115.9  -79.0%
 seconds                      1429         137         1,292  942.3%
 paired TFL difference: -342,381 per cell (-55.4% of the twin, median cell -54.2%), 6/6 cells better, worst cell -258,567
 Wilcoxon signed-rank p = 0.031 (n = 6, so the smallest reportable p is 0.031 - never call this strong)
+step 1 gate (TFL at least 20% below the twin): PASS
+
+=== pilot/leaf60: eps_greedy vs eps_greedy (60 cells: S0/seed0, S0/seed1, S0/seed2, S0/seed3, S0/seed4, S0/seed5, S0/seed6, S0/seed7, S0/seed8, S0/seed9, S1/seed0, S1/seed1, S1/seed2, S1/seed3, S1/seed4, S1/seed5, S1/seed6, S1/seed7, S1/seed8, S1/seed9, S2/seed0, S2/seed1, S2/seed2, S2/seed3, S2/seed4, S2/seed5, S2/seed6, S2/seed7, S2/seed8, S2/seed9, S3/seed0, S3/seed1, S3/seed2, S3/seed3, S3/seed4, S3/seed5, S3/seed6, S3/seed7, S3/seed8, S3/seed9, S4/seed0, S4/seed1, S4/seed2, S4/seed3, S4/seed4, S4/seed5, S4/seed6, S4/seed7, S4/seed8, S4/seed9, S5/seed0, S5/seed1, S5/seed2, S5/seed3, S5/seed4, S5/seed5, S5/seed6, S5/seed7, S5/seed8, S5/seed9) ===
+metric                      pilot         twin    paired diff      rel
+tfl                       234,913     588,924     -3.54e+05  -60.1%
+fraud_loss                 57,223      60,788        -3,565   -5.9%
+mfa_cost                  140,675     311,020    -1.703e+05  -54.8%
+review_cost                37,015     217,116    -1.801e+05  -83.0%
+friction_rate            15.9435%    38.2839%       -0.2234  -58.4%
+fraud_stopped               71.1%       75.2%      -0.04079   -5.4%
+mfa_per_day                 385.1       851.3        -466.3  -54.8%
+reviews_per_day              20.3       118.9        -98.62  -83.0%
+seconds                      1518          78         1,440 1844.9%
+paired TFL difference: -354,011 per cell (-60.1% of the twin, median cell -60.3%), 60/60 cells better, worst cell -229,554
+Wilcoxon signed-rank p = 0.000 (n = 60, so the smallest reportable p is 0.000 - never call this strong)
 step 1 gate (TFL at least 20% below the twin): PASS
 
 === pilot/monthly_mu100: sqcb_rf_monthly vs rf_monthly (6 cells: S0/seed0, S0/seed1, S0/seed2, S1/seed0, S1/seed1, S1/seed2) ===
@@ -83,4 +125,18 @@ mfa_per_day                 104.2        21.8         82.43  378.8%
 reviews_per_day              89.3         7.3            82 1124.8%
 seconds                       139         118         21.85   18.6%
 paired TFL difference: +174,399 per cell (+179.2% of the twin, median cell +384.3%), 0/6 cells better, worst cell +192,040
+Wilcoxon signed-rank p = 0.031 (n = 6, so the smallest reportable p is 0.031 - never call this strong)
+
+=== pilot/prob600: prob_rule vs eps_greedy (6 cells: S1/seed0, S1/seed1, S3/seed0, S3/seed1, S5/seed0, S5/seed1) ===
+metric                      pilot         twin    paired diff      rel
+tfl                       219,400     563,060    -3.437e+05  -61.0%
+fraud_loss                 70,380      63,254         7,127   11.3%
+mfa_cost                  133,804     317,353    -1.835e+05  -57.8%
+review_cost                15,216     182,453    -1.672e+05  -91.7%
+friction_rate            14.7782%    38.2372%       -0.2346  -61.4%
+fraud_stopped               60.4%       71.3%       -0.1091  -15.3%
+mfa_per_day                 365.9       867.9        -501.9  -57.8%
+reviews_per_day               8.3        99.8        -91.48  -91.7%
+seconds                        58          80        -22.78  -28.3%
+paired TFL difference: -343,659 per cell (-61.0% of the twin, median cell -60.6%), 6/6 cells better, worst cell -304,256
 Wilcoxon signed-rank p = 0.031 (n = 6, so the smallest reportable p is 0.031 - never call this strong)

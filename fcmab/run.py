@@ -121,8 +121,9 @@ def main(argv=None):
     ap.add_argument("--seeds", nargs="+", default=["0"], help="seed numbers, or 'all' (config.SEEDS)")
     ap.add_argument("--policies", nargs="+", default=["all"], help="policy names, or 'all'")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 0))
-    ap.add_argument("--params", default=os.path.join(C.RESULTS_DIR, "tuned_params.json"),
-                    help="JSON of parameter overrides (default: tuned bandit parameters, if present)")
+    ap.add_argument("--params", default=None,
+                    help="JSON of parameter overrides (default: Results/tuned_params.json, if present; "
+                         "a path you name must exist)")
     ap.add_argument("--results", help="write run logs here instead of Results/ (a variant of an "
                                       "existing policy goes in its own folder so the corpus keeps "
                                       "the run it is compared against). Needs no environment "
@@ -136,7 +137,8 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.results:
         C.RESULTS_DIR = os.path.abspath(a.results)
-    C.load_overrides(a.params)
+    C.load_overrides(a.params or os.path.join(C.RESULTS_DIR, "tuned_params.json"),
+                     required=a.params is not None)
     scenarios = C.SCENARIOS if a.scenarios == ["all"] else a.scenarios
     seeds = C.SEEDS if a.seeds == ["all"] else [int(s) for s in a.seeds]
     policies = C.POLICIES if a.policies == ["all"] else a.policies
