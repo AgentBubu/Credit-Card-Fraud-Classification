@@ -134,10 +134,17 @@ def main(argv=None):
     policies = C.POLICIES if a.policies == ["all"] else a.policies
 
     from . import data
+
+    def cost(p):
+        """RUN_COST_S is measured per policy name, but a bandit with leaf features costs about 13x
+        more per run (measured: 1,041 s against 78 s), and --params can turn that on. Without this
+        a 3 h grid announces itself as 8 min, which looks like a hung process."""
+        return C.RUN_COST_S.get(p, 100.0) * (13.0 if C.USE_LEAF_FEATURES and p in C.BANDITS else 1.0)
+
     jobs = [(s, k, p, a.params) for s in scenarios for k in seeds for p in policies
             if a.rerun or not os.path.exists(run_path(s, k, p) + ".json")]
     # cost from fcmab/config.py:RUN_COST_S, measured on this box (one core per run)
-    serial = sum(C.RUN_COST_S.get(p, 100.0) for _, _, p, _ in jobs)
+    serial = sum(cost(p) for _, _, p, _ in jobs)
     todo = [(s, k) for s in scenarios for k in seeds]
     cold = sum(1 for s, k in todo if not data.cached(s, k))
     print(f"{len(jobs)} runs to do on {a.jobs} processes: "
@@ -145,10 +152,10 @@ def main(argv=None):
     if cold:
         print(f"   {cold} of {len(todo)} scenario caches missing, ~{C.CACHE_BUILD_S * cold / 60:.0f} min "
               f"of CPU to build them (~{C.CACHE_BUILD_S * cold / min(a.jobs, 12) / 60:.0f} min wall)")
-    for p in sorted({p for _, _, p, _ in jobs}, key=lambda p: -C.RUN_COST_S.get(p, 100.0)):
+    for p in sorted({p for _, _, p, _ in jobs}, key=lambda p: -cost(p)):
         n = sum(1 for _, _, q, _ in jobs if q == p)
-        print(f"   {n:3d} × {p:12s} {C.RUN_COST_S.get(p, 100.0):6.0f}s each = "
-              f"{n * C.RUN_COST_S.get(p, 100.0) / 3600:5.2f} h CPU")
+        print(f"   {n:3d} × {p:12s} {cost(p):6.0f}s each = "
+              f"{n * cost(p) / 3600:5.2f} h CPU")
     if a.plan:
         return 0
     # Scenario caches first, and in parallel: one cold build costs ~5 min and a fresh clone
