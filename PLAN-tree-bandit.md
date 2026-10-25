@@ -298,3 +298,79 @@ at `--jobs 8`, ~20 h at the measured-safe `--jobs 4`), ~70 h for all three bandi
 columns is what the 13x runtime pays for, and it is avoidable. Step 3 (`tree_ucb`) is unchanged in
 the plan and now has a stronger reason to be tried: the leaf features prove that tree structure is
 what the linear policy was missing.
+
+## 9. Step 1 at full scale: the 60-cell grid (2026-10-25)
+
+54 new runs plus the 6 cells of section 8 (same parameters, byte-identical settings, copied in),
+`--jobs 6`, 233 min wall, 1,518 s per run at 6-way against 1,041 s solo. That is 22.8 h of CPU
+against 23.3 h of worker capacity: ~98% parallel efficiency, so `--jobs` is not the problem. The
+planner's own ETA (101 min) was wrong for the same reason as before - `RUN_COST_S x 13` = 676 s
+describes a *solo* run; under 6-way memory contention a leaf run costs ~1.5x that. Grid output:
+`Results/pilot/leaf60/`, command in `Results/pilot/run_leaf60.sh`, numbers in
+`Results/pilot/leaf60/report.txt`.
+
+**Against the outcomes pre-registered in section 4, in the order they were written there:**
+
+- *"Idea works": a tree/forest-based bandit beats `eps_greedy` by >=2x on the 60-cell mean with a
+  positive paired difference in the large majority of cells* - **MET**. 234,913 vs 588,924 = 2.51x,
+  60/60 cells better, worst cell -229,554, Wilcoxon p = 1.6e-11. Per scenario the paired test sits
+  exactly on its n = 10 floor (p = 0.002) in all six, S0 through S5, 10/10 cells each.
+- *"also beats `rf_monthly` (TFL 69k), and then the headline changes"* - **NOT MET**. 234,913 is
+  3.4x worse than `rf_monthly` (69,471) and 1.6x worse than either frozen forest (143k). The
+  paper's conclusion is untouched: the retrained supervised forest still wins, and this grid
+  narrows the bandit gap from 8.5x to 3.4x rather than closing it.
+- *"nothing beats `eps_greedy`"* - not the case, so the ladder continues.
+
+**What the 354k per cell is made of, and why it is not 354k of better fraud detection.** Over the
+60 cells: review cost -83% (217k -> 37k), MFA cost -55% (311k -> 141k), fraud loss -5.9% (60.8k ->
+57.2k). Friction 38.3% -> 15.9%, and `rf_monthly`'s friction is 1.5%, so the leaf bandit is still
+an order of magnitude noisier than the thing that beats it. Fraud stopped goes *down*, 75.2% ->
+71.1%, and per scenario that is where the interesting part is:
+
+| scenario | fraud stopped, leaf on vs off |
+|---|---|
+| S0 (stationary) | 96.5% vs 94.5% (**+2.1 pp**) |
+| S1, S2, S4 | -1.5, -2.1, -1.4 pp |
+| S3 (drift) | 91.5% vs 95.7% (-4.2 pp) |
+| S5 (adversarial drift) | 28.9% vs 46.3% (**-17.3 pp**) |
+
+On the stationary scenario the leaf space is a strict improvement - cheaper *and* it stops more
+fraud. Under drift the same frozen 2019 leaf space buys the saving partly by *detecting less*:
+S5 pays 229k fewer dollars and lets 17 pp more fraud through. That is the selection-bias caution of
+section 1 showing up in the measurement, and it says the representation has to be refreshed with
+the distribution, not just made non-linear. It is also the strongest argument in this plan against
+the frozen-forest framing and for the monthly-refit path the corpus already has.
+
+**Data incident, recovery, and the fix - recorded because it was the run, not the result, that
+failed.** `run --results` set `C.RESULTS_DIR` in the parent only. The workers are `spawn` processes:
+a child re-imports `fcmab.config`, so it never sees a value the parent assigned after import, and
+all 54 leaf runs were written to `Results/runs/**/eps_greedy.*` - over the corpus baseline they were
+supposed to be compared against. Exit code 0, no warning, and the plan's own skip-existing logic is
+what limited the damage: the 6 section-8 cells already existed in the pilot folder, were skipped,
+and those 6 leafless twins survived, which is the only reason the comparison was still computable.
+
+- Restored the 54 cells from the pre-incident copy `C:/fcmab_backup/runs_20261025` (480 files, newest
+  2026-10-24 21:38), chosen by the recorded `USE_LEAF_FEATURES` flag rather than by mtime, and copied
+  the leaf-ON runs to `Results/pilot/leaf60/` first so nothing was destroyed by the restore.
+- Proof, both re-run after the restore: `python main.py check` -> `480 runs checked, 0 problem(s)`,
+  and `python main.py fingerprint` recomputed to a temp file -> 480/480 sha256 identical to
+  `Results/corpus_fingerprints.json`, 0 mismatches.
+- Fix: the output path is now resolved once in the parent and travels inside the job tuple, so a
+  child writes where the parent decided and cannot choose a directory of its own. Verified with a
+  scratch 2-cell grid at `--jobs 2` through the same spawn pool: both files landed under `--results`
+  and 0 of the 480 corpus files changed.
+- Standing rule this implies: `FCMAB_RESULTS` was the only mechanism that survived `spawn`, because
+  children inherit the parent's environment. Any future per-run setting has to be passed in the job,
+  not assigned after import.
+
+**Gates from section 4 still open for this grid:** `check --replay` on leaf-ON cells (each replay is
+one full re-simulation, ~25 min CPU, so a 2-cell replay is ~50 min - not yet run), and a decision on
+whether the leaf variant enters the paper's tables and Figures 1-3 or stays a plan-level finding;
+`Results/tables/` is unchanged because the variant lives outside the corpus folder.
+
+**Consequence for the ladder.** Step 3 (`tree_ucb`) is still worth the ~90 lines, and the drift
+column above sharpens what it must do: refit the leaf space on the same monthly schedule as
+`rf_monthly`, because a *frozen* non-linear context is what loses 17 pp under attack. The ceiling
+argues for spending the next unit of work somewhere else though - with the best context this policy
+family can get it is still 3.4x above `rf_monthly`, and 93.5% of that remaining 165k gap is
+intervention fees (128k MFA + 26k review) against 6.5% fraud loss (10.8k).

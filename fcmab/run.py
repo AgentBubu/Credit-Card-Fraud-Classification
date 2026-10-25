@@ -95,10 +95,9 @@ def _build(pair):
 
 
 def _worker(job):
-    scenario, seed, policy, params = job
+    scenario, seed, policy, params, path = job
     from . import config, data, simulator
     config.load_overrides(params)
-    path = run_path(scenario, seed, policy)
     try:
         d = data.build(scenario, seed, verbose=False)
         out, info = simulator.run(scenario, seed, policy, d=d)
@@ -150,10 +149,15 @@ def main(argv=None):
         a 3 h grid announces itself as 8 min, which looks like a hung process."""
         return C.RUN_COST_S.get(p, 100.0) * (13.0 if C.USE_LEAF_FEATURES and p in C.BANDITS else 1.0)
 
-    jobs = [(s, k, p, a.params) for s in scenarios for k in seeds for p in policies
+    # The output path travels inside the job because the workers are spawn processes: a child
+    # re-imports fcmab.config, so a RESULTS_DIR the parent mutated after import is invisible to
+    # it, and a `run --results` grid wrote all 54 of its runs over the corpus instead (2026-10-25;
+    # restored from C:/fcmab_backup/runs_20261025, 480/480 fingerprints match). The parent already
+    # resolved the path to decide what was left to do, so it is the only authority on it.
+    jobs = [(s, k, p, a.params, run_path(s, k, p)) for s in scenarios for k in seeds for p in policies
             if a.rerun or not os.path.exists(run_path(s, k, p) + ".json")]
     # cost from fcmab/config.py:RUN_COST_S, measured on this box (one core per run)
-    serial = sum(cost(p) for _, _, p, _ in jobs)
+    serial = sum(cost(p) for _, _, p, _, _ in jobs)
     todo = [(s, k) for s in scenarios for k in seeds]
     cold = sum(1 for s, k in todo if not data.cached(s, k))
     print(f"{len(jobs)} runs to do on {a.jobs} processes: "
@@ -161,8 +165,8 @@ def main(argv=None):
     if cold:
         print(f"   {cold} of {len(todo)} scenario caches missing, ~{C.CACHE_BUILD_S * cold / 60:.0f} min "
               f"of CPU to build them (~{C.CACHE_BUILD_S * cold / min(a.jobs, 12) / 60:.0f} min wall)")
-    for p in sorted({p for _, _, p, _ in jobs}, key=lambda p: -cost(p)):
-        n = sum(1 for _, _, q, _ in jobs if q == p)
+    for p in sorted({p for _, _, p, _, _ in jobs}, key=lambda p: -cost(p)):
+        n = sum(1 for _, _, q, _, _ in jobs if q == p)
         print(f"   {n:3d} × {p:12s} {cost(p):6.0f}s each = "
               f"{n * cost(p) / 3600:5.2f} h CPU")
     if a.plan:

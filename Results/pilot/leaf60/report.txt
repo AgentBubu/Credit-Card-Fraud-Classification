@@ -1,0 +1,53 @@
+Step 1 at full scale: eps_greedy with frozen-forest LEAF arms, 60 cells
+================================================================================================
+grid Results/pilot/leaf60 (USE_LEAF_FEATURES=True) vs twin Results/runs (False); everything else
+identical: WARM_N 600000, EPSILON 0.001, ALPHA/TS_SCALE 0.03. Paired per cell, 6 scenarios x 10 seeds.
+6 cells came from the step-1 pilot (Results/pilot/leaf, byte-identical settings), 54 are new.
+
+metric                 leaf on      leaf off          diff       rel
+tfl                  2.349e+05     5.889e+05     -3.54e+05    -60.1%
+fraud_loss           5.722e+04     6.079e+04        -3,565     -5.9%
+mfa_cost             1.407e+05      3.11e+05    -1.703e+05    -54.8%
+review_cost          3.701e+04     2.171e+05    -1.801e+05    -83.0%
+friction_rate           0.1594        0.3828       -0.2234    -58.4%
+fraud_stopped            0.711        0.7518      -0.04079     -5.4%
+mfa_per_day              385.1         851.3        -466.3    -54.8%
+reviews_per_day          20.26         118.9        -98.62    -83.0%
+seconds                  1,518         78.04         1,440   1844.9%
+
+paired TFL -354,011/cell (-60.1%), 60/60 cells better, Wilcoxon p=1.63e-11, worst cell -229,554
+registered criterion (>=2x below eps_greedy, large majority of cells better): MET - 2.51x lower
+
+per scenario (n=10: the Wilcoxon floor is p=0.002, never present it as strong)
+scen    leaf TFL    off TFL  ratio  better          p  stop on  stop off   fraud stopped change
+
+S0       197,329    642,054   0.31  10/10   1.95e-03    96.5%     94.5%       +2.1 pp
+S1       237,027    603,912   0.39  10/10   1.95e-03    70.4%     72.0%       -1.5 pp
+S2       235,078    607,438   0.39  10/10   1.95e-03    70.2%     72.3%       -2.1 pp
+S3       252,302    526,774   0.48  10/10   1.95e-03    91.5%     95.7%       -4.2 pp
+S4       234,747    604,930   0.39  10/10   1.95e-03    69.0%     70.4%       -1.4 pp
+S5       252,995    548,437   0.46  10/10   1.95e-03    28.9%     46.3%      -17.3 pp
+
+60-cell mean TFL, every policy (lower is better)
+  oracle                                    5,437
+  rf_monthly                               69,471
+  xgb_frozen                              142,592
+  rf_frozen                               143,144
+  eps_greedy + leaf arms (this grid)      234,913
+  linucb                                  584,987
+  lints                                   586,373
+  eps_greedy                              588,924
+  approve_all                           1,544,850
+
+component means, against what the paper's headline rests on
+policy                                       tfl  fraud_loss    mfa_cost review_cost  friction  stopped
+eps_greedy + leaf arms (this grid)     2.349e+05   5.722e+04   1.407e+05   3.701e+04    0.1594    0.711
+rf_monthly (headline winner)           6.947e+04   4.644e+04   1.219e+04   1.085e+04   0.01452   0.8081
+rf_frozen                              1.431e+05    1.24e+05       7,928   1.125e+04   0.01013   0.6034
+xgb_frozen                             1.426e+05   1.305e+05       4,926       7,183  0.006011   0.5995
+eps_greedy (leafless)                  5.889e+05   6.079e+04    3.11e+05   2.171e+05    0.3828   0.7518
+
+not a win where it looks like one: the TFL gain is fees (MFA -55%, review -83%), fraud loss moves
+-5.9% only, and fraud_stopped falls 75.2% -> 71.1%. S0 gains +2.0 pp of detection, S3 -4.2 pp and
+S5 -17.4 pp: under drift the frozen 2019 leaf space stops separating fraud from legitimate spend.
+Cost of the grid: 54 runs, 233 min wall at --jobs 6, 1,518 s/run at 6-way against 1,041 s solo.
