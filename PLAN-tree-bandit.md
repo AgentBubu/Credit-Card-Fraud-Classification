@@ -363,10 +363,29 @@ and those 6 leafless twins survived, which is the only reason the comparison was
   children inherit the parent's environment. Any future per-run setting has to be passed in the job,
   not assigned after import.
 
-**Gates from section 4 still open for this grid:** `check --replay` on leaf-ON cells (each replay is
-one full re-simulation, ~25 min CPU, so a 2-cell replay is ~50 min - not yet run), and a decision on
-whether the leaf variant enters the paper's tables and Figures 1-3 or stays a plan-level finding;
-`Results/tables/` is unchanged because the variant lives outside the corpus folder.
+**Gate `check --replay`: CLOSED - 5 runs re-simulated, 0 differ.**
+
+| replayed | folder | logged rows | result |
+|---|---|---|---|
+| S5 seed9 eps_greedy (leaf on) | `Results/pilot/leaf60` | 166,755 | OK, every column |
+| S0 seed3 eps_greedy (leaf on) | `Results/pilot/leaf60` | 140,671 | OK, every column |
+| S1 seed0 eps_greedy (corpus control) | `Results/runs` | 358,658 | OK, every column |
+| S0 seed3 eps_greedy (leafless) | `Results/runs` | 360,218 | OK, every column |
+| S5 seed9 eps_greedy (leafless) | `Results/runs` | 356,411 | OK, every column |
+
+`fingerprint.replay(paths=[...])` takes explicit cells, so no environment variable is involved, and it
+writes nothing - it re-simulates from the scenario caches and compares every column against the stored
+`.npz`. The three leaf/corpus cells took 42 min wall, which matches the stored per-run cost
+(1,469 s + 1,836 s + 92 s), so the run cannot have skipped a cell.
+
+The last two rows are the *restored* corpus cells, and they matter for the incident as much as for the
+grid: they show the current code reproduces those runs column-for-column, so the restore is proven
+twice over - identical to the pre-incident fingerprints (480/480 sha256) *and* reproducible from the
+code that is committed.
+
+**Still open from section 4:** one decision, not one measurement - whether the leaf variant becomes a
+row in the paper's tables and Figures 1-3 or stays a plan-level finding. `Results/tables/` is unchanged
+either way, because the variant lives outside the corpus folder.
 
 **Consequence for the ladder.** Step 3 (`tree_ucb`) is still worth the ~90 lines, and the drift
 column above sharpens what it must do: refit the leaf space on the same monthly schedule as
@@ -374,3 +393,59 @@ column above sharpens what it must do: refit the leaf space on the same monthly 
 argues for spending the next unit of work somewhere else though - with the best context this policy
 family can get it is still 3.4x above `rf_monthly`, and 93.5% of that remaining 165k gap is
 intervention fees (128k MFA + 26k review) against 6.5% fraud loss (10.8k).
+
+## 10. The decision, not the representation: what the leaf result points at (written before running)
+
+Section 9 leaves a bandit that is 3.4x above `rf_monthly` with the best context this family can get,
+and 93.5% of that gap is intervention fees. Reading the stored logs says the fees are being spent in
+the wrong place. The cost matrix (`C_MFA` $1, `C_REV` $5, `MFA_BYPASS` 0.10, chargeback probability
+0.9) implies a two-threshold rule on expected fraud dollars `x = P(fraud) x amount`:
+
+```
+approve below $1.25   |   MFA $1.25 - $40   |   review above $40
+```
+
+What the runs actually do (S1 seed0, logged stream, $1.32M of fraud):
+
+| amount | rows | realised fraud rate | share of fraud dollars |
+|---|---|---|---|
+| under $100 | 105,518 (75%) | 0.4-5.9% | **3.1%** |
+| $250 and above | 12,655 (9%) | 9.6-19.0% | **82.8%** |
+
+A $1 challenge on a sub-$50 legitimate transaction has an expected saving of about $0.39 - negative
+expected value before any estimation error. Yet `eps_greedy` with leaf arms sends 133,563 MFA
+challenges a year at a median legitimate amount of $51 (fraud rate in that arm 0.22%), while
+`rf_monthly` sends 10,820 at a median of $399 (fraud rate 2.75%). `log_amt` is in the context for
+both, so this is not a missing feature: the bandit estimates three free arm-values and hopes the
+amount scaling comes out of the reward, while `Supervised` estimates one probability and applies the
+known costs in the decision step - its own docstring says "Costs are used only in the decision step".
+
+**Ladder.**
+
+- **D0 - is the ordering any good? (~2 min, one run, logging only.)** Log the three estimated arm
+  values for one run and check whether the estimated advantage of intervening over approving grows
+  with amount at all. Run it on the *leafless* `eps_greedy` (92 s, not 1,518 s): the question is about
+  the decision, and the leaf arms cost 13x to answer it. If that advantage is flat in amount, D1
+  cannot work and D2 is the only route; if it is ordered but mis-scaled, a margin is enough.
+- **D1 - one dollar margin (~10 lines).** Approve unless the best arm beats `approve`'s estimate by
+  more than `DELTA` dollars. Sweep `DELTA` in {0, 5, 20, 100} on the 6 pilot cells with the leafless
+  policy: 24 runs, ~37 min of CPU, ~10 min wall at `--jobs 4`. Deliberately swept on the leafless
+  policy - it isolates the decision axis from the representation axis and is 13x cheaper; the winning
+  `DELTA` is then confirmed with leaf arms on the same 6 cells (~1.7 h of CPU, ~20 min at `--jobs 6`).
+- **D2 - one quantity, analytic thresholds (~25 lines), only if D1 moves.** Estimate expected fraud
+  dollars for the context, drop the two intervention arms as *estimated* arms, and take the action
+  from the rule above with the thresholds computed from `C_MFA`, `C_REV`, `MFA_BYPASS` and the
+  chargeback probability - never tuned. Bandit feedback stays: the chargeback still arrives delayed
+  and still updates the estimate.
+
+**Gate, written before running anything, on the 6 pilot cells (S0/S1 x seeds 0-2):** friction at or
+below 5% (the leaf grid runs 15.9%), **and** TFL at or below 140k on those cells (about half the
+remaining distance to `rf_monthly`), **and** `fraud_stopped` not below the leaf-on value on the same
+cells. The third condition is what the aggregate hid in section 9: S5 paid 17.3 pp of detection for
+its saving, so a threshold cut that passes on cost alone is not a pass.
+
+**What each outcome means.** All three: the paper gains a real result - the gap between bandits and
+retrained forests is mostly the decision rule, not the value function. Friction and detection but not
+TFL: the estimator is the binding constraint, and the honest report is that a better context or a
+calibrated probability is required, which is the negative half of the same finding. Nothing: the
+margin is not the lever, and the ladder stops here rather than buying a 60-cell grid of it.
